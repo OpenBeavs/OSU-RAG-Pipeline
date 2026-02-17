@@ -45,6 +45,7 @@ load_dotenv()
 ROOT_DIR = Path(__file__).resolve().parent
 HASH_STORE_PATH = ROOT_DIR / "url_hashes.json"
 URLS_FILE = ROOT_DIR / "urls.txt"
+DISCOVERED_URLS_FILE = ROOT_DIR / "discovered_urls.json"
 
 EMBEDDING_MODEL = "models/text-embedding-004"
 EMBEDDING_DIMENSION = 768
@@ -271,21 +272,40 @@ def load_urls(path: Path = URLS_FILE) -> list[str]:
     return urls
 
 
+def load_discovered_urls(path: Path = DISCOVERED_URLS_FILE) -> list[str]:
+    """Load URLs from the crawler's discovered_urls.json output."""
+    if not path.exists():
+        log.error("Discovered URLs file not found: %s", path)
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    urls = list(data.get("urls", {}).keys())
+    return urls
+
+
 # ══════════════════════════════════════════════
 # 8.  Main Pipeline
 # ══════════════════════════════════════════════
-def run_pipeline(dry_run: bool = False) -> None:
+def run_pipeline(dry_run: bool = False, use_crawler: bool = False) -> None:
     """Execute the full ETL pipeline."""
     log.info("=" * 60)
     log.info("OSU RAG ETL Pipeline -- starting run")
     log.info("=" * 60)
 
-    # --- load URLs ---
-    urls = load_urls()
+    # --- crawl (if requested) ---
+    if use_crawler:
+        from crawler import crawl
+        crawl()
+        urls = load_discovered_urls()
+        source = DISCOVERED_URLS_FILE
+    else:
+        urls = load_urls()
+        source = URLS_FILE
+
     if not urls:
-        log.warning("No URLs to process. Add URLs to %s", URLS_FILE)
+        log.warning("No URLs to process. Add URLs to %s", source)
         return
-    log.info("Loaded %d URL(s) from %s", len(urls), URLS_FILE)
+    log.info("Loaded %d URL(s) from %s", len(urls), source)
 
     # --- init state manager ---
     state = StateManager()
@@ -401,8 +421,13 @@ def main() -> None:
         action="store_true",
         help="Run the pipeline without calling external APIs (embedding & Pinecone).",
     )
+    parser.add_argument(
+        "--crawl",
+        action="store_true",
+        help="Run the BFS web crawler first to discover URLs before processing.",
+    )
     args = parser.parse_args()
-    run_pipeline(dry_run=args.dry_run)
+    run_pipeline(dry_run=args.dry_run, use_crawler=args.crawl)
 
 
 if __name__ == "__main__":

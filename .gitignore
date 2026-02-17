@@ -182,3 +182,4 @@ cython_debug/
 
 # ETL Pipeline state
 url_hashes.json
+discovered_urls.json
