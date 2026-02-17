@@ -1,0 +1,24 @@
+{
+  "name": "osu_rag_agent",
+  "description": "An Oregon State University expert agent that answers questions using a RAG knowledge base built from oregonstate.edu content. It searches a vector database of crawled OSU pages and provides accurate, source-cited answers about admissions, academics, financial aid, campus life, and more.",
+  "version": "1.0.0",
+  "url": "http://localhost:8000",
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false
+  },
+  "skills": [
+    {
+      "id": "osu-knowledge-search",
+      "name": "OSU Knowledge Search",
+      "description": "Search the Oregon State University knowledge base for information about admissions, academics, financial aid, housing, campus resources, and other OSU topics.",
+      "examples": [
+        "What are the admissions requirements for Oregon State University?",
+        "How do I apply for financial aid at OSU?",
+        "What majors does Oregon State offer in engineering?",
+        "Tell me about housing options at OSU",
+        "Who is the president of Oregon State University?"
+      ]
+    }
+  ]
+}

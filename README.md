@@ -254,6 +254,49 @@ Each vector stored in Pinecone includes:
 
 ---
 
+## 🤖 RAG Query Agent (Google ADK + A2A)
+
+An AI agent that answers OSU questions by searching the Pinecone knowledge base. Built with [Google ADK](https://google.github.io/adk-docs/) and exposes an [A2A](https://a2aprotocol.org/) endpoint for inter-agent communication.
+
+### Install Agent Dependencies
+
+```bash
+pip install -r agent_requirements.txt
+```
+
+### Run with ADK Dev UI
+
+```bash
+# From the project root (parent of osu_rag_agent/)
+adk web
+```
+
+Select **osu_rag_agent** from the dropdown and start chatting.
+
+> **Windows note:** If you hit `_make_subprocess_transport NotImplementedError`, use `adk web --no-reload`.
+
+### Serve via A2A Protocol
+
+```bash
+adk api_server --a2a
+```
+
+The Agent Card is served at `http://localhost:8000/.well-known/agent.json`. Other agents (e.g., a Master Router) can discover and communicate with this agent using the A2A protocol.
+
+### Project Structure (Agent)
+
+```
+OSU-RAG-Pipeline/
+├── osu_rag_agent/
+│   ├── __init__.py        # Package init
+│   ├── agent.py           # ADK agent + Pinecone RAG search tool
+│   └── agent.json         # A2A Agent Card
+├── agent_requirements.txt # Agent dependencies
+└── ...                    # ETL pipeline files
+```
+
+---
+
 ## License
 
 MIT
