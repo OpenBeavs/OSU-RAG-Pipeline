@@ -1,0 +1,20 @@
+# OSU RAG ETL Pipeline — Dependencies
+# Python 3.10+
+
+# --- Vector Database ---
+pinecone==5.4.2
+
+# --- Google GenAI Embeddings ---
+google-genai==1.5.0
+
+# --- Text Splitting ---
+langchain-text-splitters==0.3.6
+tiktoken==0.8.0
+
+# --- Web Scraping & Parsing ---
+beautifulsoup4==4.13.3
+requests==2.32.3
+lxml==5.3.1
+
+# --- Environment ---
+python-dotenv==1.0.1

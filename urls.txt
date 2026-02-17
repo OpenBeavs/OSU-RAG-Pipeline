@@ -1,0 +1,8 @@
+# OSU URLs to index — one per line
+# Lines starting with # are ignored.
+https://oregonstate.edu
+https://admissions.oregonstate.edu
+https://financialaid.oregonstate.edu
+https://registrar.oregonstate.edu
+https://catalog.oregonstate.edu
+https://studentlife.oregonstate.edu
