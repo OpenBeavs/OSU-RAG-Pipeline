@@ -47,7 +47,7 @@ HASH_STORE_PATH = ROOT_DIR / "url_hashes.json"
 URLS_FILE = ROOT_DIR / "urls.txt"
 DISCOVERED_URLS_FILE = ROOT_DIR / "discovered_urls.json"
 
-EMBEDDING_MODEL = "models/text-embedding-004"
+EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIMENSION = 768
 EMBEDDING_BATCH_SIZE = 100          # Google GenAI max per request
 
@@ -189,6 +189,7 @@ def embed_chunks(client: genai.Client, chunks: list[str]) -> list[list[float]]:
         result = client.models.embed_content(
             model=EMBEDDING_MODEL,
             contents=batch,
+            config={"output_dimensionality": EMBEDDING_DIMENSION},
         )
         all_embeddings.extend([e.values for e in result.embeddings])
 
