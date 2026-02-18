@@ -2,7 +2,7 @@
 OSU RAG Query Agent
 ===================
 A Google ADK agent that answers Oregon State University questions
-by searching a Pinecone vector database populated by the ETL pipeline.
+by searching a Firestore vector database populated by the ETL pipeline.
 
 Exposes an A2A-compatible endpoint for inter-agent communication.
 """
@@ -15,7 +15,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.adk.agents import Agent
-from pinecone import Pinecone
+from google.cloud import firestore
+from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
+from google.cloud.firestore_v1.vector import Vector
 
 # ──────────────────────────────────────────────
 # Configuration
@@ -26,8 +28,8 @@ _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_ENV_PATH)
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "")
-PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "osu-archiving")
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
+FIRESTORE_COLLECTION = os.environ.get("FIRESTORE_COLLECTION", "osu-knowledge")
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIMENSION = 768
@@ -37,7 +39,7 @@ EMBEDDING_DIMENSION = 768
 # ──────────────────────────────────────────────
 
 _genai_client: genai.Client | None = None
-_pc_index = None
+_fs_collection = None
 
 
 def _get_genai_client() -> genai.Client:
@@ -47,12 +49,12 @@ def _get_genai_client() -> genai.Client:
     return _genai_client
 
 
-def _get_pinecone_index():
-    global _pc_index
-    if _pc_index is None:
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        _pc_index = pc.Index(PINECONE_INDEX_NAME)
-    return _pc_index
+def _get_firestore_collection():
+    global _fs_collection
+    if _fs_collection is None:
+        fs_client = firestore.Client(project=GCP_PROJECT_ID)
+        _fs_collection = fs_client.collection(FIRESTORE_COLLECTION)
+    return _fs_collection
 
 
 # ──────────────────────────────────────────────
@@ -62,8 +64,8 @@ def _get_pinecone_index():
 def search_osu_knowledge(query: str, top_k: int = 5) -> dict:
     """Search the OSU knowledge base for information relevant to the query.
 
-    Embeds the query and performs a semantic search against the Pinecone
-    vector database containing chunked content from *.oregonstate.edu pages.
+    Embeds the query and performs a semantic vector search against the
+    Firestore collection containing chunked content from *.oregonstate.edu.
 
     Args:
         query: The search query describing what information to find.
@@ -86,23 +88,24 @@ def search_osu_knowledge(query: str, top_k: int = 5) -> dict:
         )
         query_embedding = embed_result.embeddings[0].values
 
-        # Query Pinecone
-        index = _get_pinecone_index()
-        results = index.query(
-            vector=query_embedding,
-            top_k=top_k,
-            include_metadata=True,
+        # Query Firestore with vector search
+        collection = _get_firestore_collection()
+        vector_query = collection.find_nearest(
+            vector_field="embedding",
+            query_vector=Vector(query_embedding),
+            distance_measure=DistanceMeasure.COSINE,
+            limit=top_k,
         )
 
         # Format results
         matches = []
-        for match in results.get("matches", []):
-            meta = match.get("metadata", {})
+        docs = vector_query.stream()
+        for doc in docs:
+            data = doc.to_dict()
             matches.append({
-                "text": meta.get("text", ""),
-                "url": meta.get("url", ""),
-                "title": meta.get("title", ""),
-                "score": round(match.get("score", 0.0), 4),
+                "text": data.get("text", ""),
+                "url": data.get("url", ""),
+                "title": data.get("title", ""),
             })
 
         if not matches:

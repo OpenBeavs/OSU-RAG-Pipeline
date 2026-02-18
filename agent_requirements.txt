@@ -7,8 +7,8 @@ google-adk[a2a]
 # --- Google GenAI (embeddings) ---
 google-genai>=1.5.0
 
-# --- Vector Database ---
-pinecone>=5.4.2
+# --- Vector Database (Firestore with vector search) ---
+google-cloud-firestore>=2.19.0
 
 # --- Environment ---
 python-dotenv>=1.0.1

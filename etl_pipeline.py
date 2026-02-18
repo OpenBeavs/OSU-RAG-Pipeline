@@ -3,7 +3,8 @@
 OSU RAG ETL Pipeline
 ====================
 Scrapes *.oregonstate.edu pages, chunks the text, generates embeddings via
-Google GenAI (text-embedding-004), and upserts them into Pinecone.
+Google GenAI (gemini-embedding-001), and upserts them into Firestore
+with vector search support.
 
 Designed to run as a cron job every 6 hours.  Content-hash deduplication
 ensures only changed pages are re-processed, and stale vectors are deleted
@@ -11,10 +12,10 @@ before new ones are upserted.
 
 Usage:
     python etl_pipeline.py                 # full run
-    python etl_pipeline.py --dry-run       # skip embedding & Pinecone calls
+    python etl_pipeline.py --dry-run       # skip embedding & Firestore calls
 
 Environment variables (see .env.example):
-    GOOGLE_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME
+    GOOGLE_API_KEY, GCP_PROJECT_ID, FIRESTORE_COLLECTION
 """
 
 from __future__ import annotations
@@ -34,8 +35,9 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google import genai
+from google.cloud import firestore
+from google.cloud.firestore_v1.vector import Vector
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pinecone import Pinecone
 
 # ──────────────────────────────────────────────
 # Configuration
@@ -197,63 +199,65 @@ def embed_chunks(client: genai.Client, chunks: list[str]) -> list[list[float]]:
 
 
 # ══════════════════════════════════════════════
-# 6.  Pinecone Operations
+# 6.  Firestore Operations
 # ══════════════════════════════════════════════
 def _url_id_prefix(url: str) -> str:
-    """Deterministic, short prefix for a URL used in vector IDs."""
+    """Deterministic, short prefix for a URL used in document IDs."""
     return hashlib.md5(url.encode()).hexdigest()[:12]
 
 
-def delete_old_vectors(index: Any, url: str) -> int:
+def delete_old_vectors(collection: Any, url: str) -> int:
     """
-    Delete all existing vectors for a URL using ID-prefix listing.
-    Returns the count of deleted vectors.
+    Delete all existing documents for a URL using url_hash field query.
+    Returns the count of deleted documents.
     """
-    prefix = _url_id_prefix(url)
+    url_hash = _url_id_prefix(url)
     deleted = 0
 
-    # Paginate through all matching IDs
-    for ids_batch in index.list(prefix=prefix):
-        if ids_batch:
-            index.delete(ids=ids_batch)
-            deleted += len(ids_batch)
+    # Query for all docs belonging to this URL
+    docs = collection.where("url_hash", "==", url_hash).stream()
+    for doc in docs:
+        doc.reference.delete()
+        deleted += 1
 
     return deleted
 
 
 def upsert_vectors(
-    index: Any,
+    collection: Any,
     url: str,
     title: str,
     chunks: list[str],
     embeddings: list[list[float]],
 ) -> int:
     """
-    Upsert chunk vectors with metadata.  Returns count of upserted vectors.
+    Upsert chunk documents with embeddings to Firestore.
+    Returns count of upserted documents.
     """
-    prefix = _url_id_prefix(url)
+    url_hash = _url_id_prefix(url)
     now_utc = datetime.now(timezone.utc).isoformat()
+    batch = collection._client.batch()
 
-    vectors = [
-        {
-            "id": f"{prefix}#{i}",
-            "values": emb,
-            "metadata": {
-                "url": url,
-                "title": title,
-                "last_crawled": now_utc,
-                "text": chunk,           # store chunk text for retrieval
-            },
-        }
-        for i, (chunk, emb) in enumerate(zip(chunks, embeddings))
-    ]
+    for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+        doc_id = f"{url_hash}#{i}"
+        doc_ref = collection.document(doc_id)
+        batch.set(doc_ref, {
+            "url": url,
+            "title": title,
+            "text": chunk,
+            "last_crawled": now_utc,
+            "url_hash": url_hash,
+            "chunk_index": i,
+            "embedding": Vector(emb),
+        })
 
-    # Pinecone supports batches of up to 100 vectors
-    UPSERT_BATCH = 100
-    for i in range(0, len(vectors), UPSERT_BATCH):
-        index.upsert(vectors=vectors[i : i + UPSERT_BATCH])
+        # Firestore batch limit is 500 writes
+        if (i + 1) % 499 == 0:
+            batch.commit()
+            batch = collection._client.batch()
 
-    return len(vectors)
+    batch.commit()
+    return len(chunks)
 
 
 # ══════════════════════════════════════════════
@@ -313,26 +317,26 @@ def run_pipeline(dry_run: bool = False, use_crawler: bool = False) -> None:
 
     # --- init external clients (skip in dry-run) ---
     genai_client: genai.Client | None = None
-    pc_index: Any = None
+    fs_collection: Any = None
 
     if not dry_run:
         import os
 
         google_api_key = os.environ.get("GOOGLE_API_KEY")
-        pinecone_api_key = os.environ.get("PINECONE_API_KEY")
-        pinecone_index_name = os.environ.get("PINECONE_INDEX_NAME", "osu-knowledge")
+        gcp_project_id = os.environ.get("GCP_PROJECT_ID")
+        firestore_collection = os.environ.get("FIRESTORE_COLLECTION", "osu-knowledge")
 
         if not google_api_key:
             log.error("GOOGLE_API_KEY not set. Aborting.")
             sys.exit(1)
-        if not pinecone_api_key:
-            log.error("PINECONE_API_KEY not set. Aborting.")
+        if not gcp_project_id:
+            log.error("GCP_PROJECT_ID not set. Aborting.")
             sys.exit(1)
 
         genai_client = genai.Client(api_key=google_api_key)
-        pc = Pinecone(api_key=pinecone_api_key)
-        pc_index = pc.Index(pinecone_index_name)
-        log.info("Connected to Pinecone index: %s", pinecone_index_name)
+        fs_client = firestore.Client(project=gcp_project_id)
+        fs_collection = fs_client.collection(firestore_collection)
+        log.info("Connected to Firestore collection: %s", firestore_collection)
 
     # --- process each URL ---
     stats = {"skipped": 0, "updated": 0, "failed": 0, "vectors_upserted": 0}
@@ -378,18 +382,18 @@ def run_pipeline(dry_run: bool = False, use_crawler: bool = False) -> None:
             stats["failed"] += 1
             continue
 
-        # Delete old vectors, then upsert new ones
-        assert pc_index is not None
+        # Delete old documents, then upsert new ones
+        assert fs_collection is not None
         try:
-            deleted = delete_old_vectors(pc_index, url)
+            deleted = delete_old_vectors(fs_collection, url)
             if deleted:
-                log.info("  -> Deleted %d stale vector(s)", deleted)
+                log.info("  -> Deleted %d stale document(s)", deleted)
 
-            count = upsert_vectors(pc_index, url, title, chunks, embeddings)
-            log.info("  -> Upserted %d vector(s)", count)
+            count = upsert_vectors(fs_collection, url, title, chunks, embeddings)
+            log.info("  -> Upserted %d document(s)", count)
             stats["vectors_upserted"] += count
         except Exception as exc:
-            log.error("  -> Pinecone operation failed: %s -- skipping", exc)
+            log.error("  -> Firestore operation failed: %s -- skipping", exc)
             stats["failed"] += 1
             continue
 
