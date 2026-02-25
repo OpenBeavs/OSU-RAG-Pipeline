@@ -183,3 +183,7 @@ cython_debug/
 # ETL Pipeline state
 url_hashes.json
 discovered_urls.json
+
+# GCP Service Account keys — NEVER commit these
+sa-key.json
+*-sa-key.json
