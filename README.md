@@ -296,6 +296,11 @@ OSU-RAG-Pipeline/
 
 ---
 
+## Storage:
+
+Vectors are stored here:
+https://console.cloud.google.com/firestore/databases/-default-/data/panel/osu-knowledge/015292636719%230?authuser=2&project=osu-genesis-hub
+
 ## License
 
 MIT
