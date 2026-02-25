@@ -21,8 +21,8 @@ A production-ready ETL pipeline that builds and maintains a **Vector Database** 
 | Component       | Technology                                       |
 | --------------- | ------------------------------------------------ |
 | Language        | Python 3.10+                                     |
-| Vector Database | [Pinecone](https://www.pinecone.io/)             |
-| Embeddings      | Google GenAI (`models/text-embedding-004`, 768d)  |
+| Vector Database | [Firestore](https://cloud.google.com/firestore/) (with vector search) |
+| Embeddings      | Google GenAI (`gemini-embedding-001`, 768d)       |
 | Text Splitting  | LangChain `RecursiveCharacterTextSplitter`       |
 | Scraping        | Beautiful Soup 4 + Requests                      |
 | Token Counting  | tiktoken (`cl100k_base`)                         |
@@ -33,10 +33,8 @@ A production-ready ETL pipeline that builds and maintains a **Vector Database** 
 
 - **Python 3.10+** installed
 - A **Google AI Studio** API key ([get one here](https://aistudio.google.com/apikey))
-- A **Pinecone** account and API key ([sign up here](https://app.pinecone.io/))
-- A Pinecone index created with:
-  - **Dimension:** `768`
-  - **Metric:** `cosine`
+- A **Google Cloud** project with Firestore enabled in Native mode ([console](https://console.cloud.google.com/firestore))
+- `gcloud` CLI installed and authenticated (`gcloud auth application-default login`)
 
 ---
 
@@ -78,10 +76,10 @@ cp .env.example .env
 Open `.env` and fill in your values:
 
 ```env
-# Required — API Keys
+# Required
 GOOGLE_API_KEY=your-google-api-key-here
-PINECONE_API_KEY=your-pinecone-api-key-here
-PINECONE_INDEX_NAME=osu-knowledge
+GCP_PROJECT_ID=your-gcp-project-id
+FIRESTORE_COLLECTION=osu-knowledge
 
 # Optional — Crawler Settings
 CRAWL_MAX_DEPTH=3          # How deep to follow links (0 = seed URLs only)
@@ -102,15 +100,13 @@ https://financialaid.oregonstate.edu
 https://registrar.oregonstate.edu
 ```
 
-### 6. Create Your Pinecone Index
+### 6. Authenticate with Google Cloud
 
-Go to the [Pinecone Console](https://app.pinecone.io/) and create an index:
+```bash
+gcloud auth application-default login
+```
 
-| Setting   | Value         |
-| --------- | ------------- |
-| Name      | `osu-knowledge` (or your `PINECONE_INDEX_NAME`) |
-| Dimension | `768`         |
-| Metric    | `cosine`      |
+Make sure your GCP project has Firestore enabled in **Native mode**. The vector index will be created automatically — or Firestore will suggest the `gcloud` command to create one on first query.
 
 ---
 
@@ -208,16 +204,19 @@ OSU-RAG-Pipeline/
 9. SAVE STATE           Persist content hashes for next run
 ```
 
-### Vector Metadata
+### Document Schema
 
-Each vector stored in Pinecone includes:
+Each chunk stored in Firestore includes:
 
 ```json
 {
   "url": "https://admissions.oregonstate.edu",
   "title": "Undergraduate Admissions | Oregon State University",
+  "text": "The actual chunk text for retrieval...",
   "last_crawled": "2026-02-17T08:30:00+00:00",
-  "text": "The actual chunk text for retrieval..."
+  "url_hash": "abc123def456",
+  "chunk_index": 0,
+  "embedding": "<768-dim vector>"
 }
 ```
 
@@ -235,8 +234,8 @@ Each vector stored in Pinecone includes:
 | Variable             | Default          | Description                                    |
 | -------------------- | ---------------- | ---------------------------------------------- |
 | `GOOGLE_API_KEY`     | *(required)*     | Google AI Studio API key                       |
-| `PINECONE_API_KEY`   | *(required)*     | Pinecone API key                               |
-| `PINECONE_INDEX_NAME`| `osu-knowledge`  | Name of your Pinecone index                    |
+| `GCP_PROJECT_ID`     | *(required)*     | Google Cloud project ID                        |
+| `FIRESTORE_COLLECTION`| `osu-knowledge` | Firestore collection name                      |
 | `CRAWL_MAX_DEPTH`    | `3`              | Max link-follow depth from seed URLs           |
 | `CRAWL_MAX_PAGES`    | `500`            | Maximum number of pages to crawl               |
 | `CRAWL_DELAY`        | `1.0`            | Seconds between HTTP requests                  |
@@ -253,6 +252,54 @@ Each vector stored in Pinecone includes:
 5. **Monitor the logs** — The pipeline logs every skip, update, and failure to stdout.
 
 ---
+
+## 🤖 RAG Query Agent (Google ADK + A2A)
+
+An AI agent that answers OSU questions by searching the Pinecone knowledge base. Built with [Google ADK](https://google.github.io/adk-docs/) and exposes an [A2A](https://a2aprotocol.org/) endpoint for inter-agent communication.
+
+### Install Agent Dependencies
+
+```bash
+pip install -r agent_requirements.txt
+```
+
+### Run with ADK Dev UI
+
+```bash
+# From the project root (parent of osu_rag_agent/)
+adk web
+```
+
+Select **osu_rag_agent** from the dropdown and start chatting.
+
+> **Windows note:** If you hit `_make_subprocess_transport NotImplementedError`, use `adk web --no-reload`.
+
+### Serve via A2A Protocol
+
+```bash
+adk api_server --a2a
+```
+
+The Agent Card is served at `http://localhost:8000/.well-known/agent.json`. Other agents (e.g., a Master Router) can discover and communicate with this agent using the A2A protocol.
+
+### Project Structure (Agent)
+
+```
+OSU-RAG-Pipeline/
+├── osu_rag_agent/
+│   ├── __init__.py        # Package init
+│   ├── agent.py           # ADK agent + Pinecone RAG search tool
+│   └── agent.json         # A2A Agent Card
+├── agent_requirements.txt # Agent dependencies
+└── ...                    # ETL pipeline files
+```
+
+---
+
+## Storage:
+
+Vectors are stored here:
+https://console.cloud.google.com/firestore/databases/-default-/data/panel/osu-knowledge/015292636719%230?authuser=2&project=osu-genesis-hub
 
 ## License
 

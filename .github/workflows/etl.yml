@@ -1,0 +1,54 @@
+name: OSU RAG ETL Pipeline
+
+on:
+  # Run automatically every 6 hours to keep the knowledge base fresh
+  schedule:
+    - cron: "0 */12 * * *"
+
+  # Also run on every push to main (e.g. config changes take effect immediately)
+  push:
+    branches:
+      - main
+
+  # Allow manual runs from the GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  run-etl:
+    name: Crawl & Embed OSU Pages
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 3. GCP Auth ──────────────────────────────────────────────────────────
+      # Authenticates using a Service Account JSON stored as a GitHub secret.
+      # The SA needs roles: roles/datastore.user (Firestore read/write)
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # ── 4. Run ETL ───────────────────────────────────────────────────────────
+      - name: Run ETL pipeline
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          FIRESTORE_COLLECTION: osu-knowledge
+          CRAWL_MAX_DEPTH: "3"
+          CRAWL_MAX_PAGES: "20000"
+          CRAWL_DELAY: ".00001"
+          CRAWL_STRIP_QUERY: "true"
+        run: python etl_pipeline.py --crawl

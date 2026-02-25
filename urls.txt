@@ -6,3 +6,6 @@ https://financialaid.oregonstate.edu
 https://registrar.oregonstate.edu
 https://catalog.oregonstate.edu
 https://studentlife.oregonstate.edu
+https://advantage.oregonstate.edu/
+https://research.oregonstate.edu/directory/john-sweet
+https://genesis.dev.oregonstate.edu/
