@@ -47,7 +47,7 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           FIRESTORE_COLLECTION: osu-knowledge
-          CRAWL_MAX_DEPTH: "3"
+          CRAWL_MAX_DEPTH: "6"
           CRAWL_MAX_PAGES: "20000"
           CRAWL_DELAY: ".00001"
           CRAWL_STRIP_QUERY: "true"
