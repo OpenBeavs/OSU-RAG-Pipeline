@@ -409,7 +409,7 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
         for tag in ("nav", "footer", "header", "script", "style", "noscript", "aside"):
             for t in soup_body.find_all(tag):
                 t.decompose()
-        page_title = (soup_body.find("title") or type("_", (), {"get_text": lambda *_: ""})()).get_text(strip=True)
+        page_title = (soup_body.find("title") or type("_", (), {"get_text": lambda *_, **__: ""})()).get_text(strip=True)
         page_text  = soup_body.get_text(separator=" ")
         word_count = len(page_text.split())
         is_thin    = word_count < MIN_TEXT_WORDS
