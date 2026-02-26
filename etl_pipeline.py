@@ -350,15 +350,16 @@ def run_pipeline(dry_run: bool = False, use_crawler: bool = False) -> None:
             stats["failed"] += 1
             continue
 
-        # Dedup check
-        content_hash = StateManager.compute_hash(html)
+        # Clean & extract text first so the hash reflects meaningful content,
+        # not raw HTML noise (timestamps, session tokens, nav changes, etc.).
+        title, text = clean_and_extract(html)
+
+        # Dedup check on cleaned text
+        content_hash = StateManager.compute_hash(text)
         if not state.has_changed(url, content_hash):
             log.info("  -> No Change -- skipping (hash match)")
             stats["skipped"] += 1
             continue
-
-        # Clean & chunk
-        title, text = clean_and_extract(html)
         if not text:
             log.warning("  -> No extractable text -- skipping")
             stats["failed"] += 1
@@ -366,9 +367,8 @@ def run_pipeline(dry_run: bool = False, use_crawler: bool = False) -> None:
 
         chunks = chunk_text(text)
         log.info("  -> Title: %s | Chunks: %d", title, len(chunks))
-
         if dry_run:
-            log.info("  -> [DRY-RUN] Would embed %d chunks & upsert to Pinecone", len(chunks))
+            log.info("  -> [DRY-RUN] Would embed %d chunks & upsert to Firestore", len(chunks))
             state.update(url, content_hash)
             stats["updated"] += 1
             continue
@@ -399,6 +399,7 @@ def run_pipeline(dry_run: bool = False, use_crawler: bool = False) -> None:
 
         # Persist hash
         state.update(url, content_hash)
+        stats["updated"] += 1
 
     # --- save state ---
     state.save()
