@@ -1,0 +1,124 @@
+# url_exclusions.txt
+# ─────────────────────────────────────────────────────────────────────────────
+# One pattern per line. Any URL containing this substring (case-insensitive)
+# will be skipped before fetching. Use # for comments.
+#
+# You can also pass patterns at runtime via the CRAWL_EXCLUDE_PATTERNS env var
+# (comma-separated), which are merged with this file.
+#
+# NOTE: Numeric IDs (/node/1234), UUIDs, and very deep paths (8+ segments)
+# are already filtered automatically by the URL quality heuristic in crawler.py.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Library catalog & search (millions of book/item pages) ───────────────────
+library.oregonstate.edu/primo-explore
+library.oregonstate.edu/catalog
+search.library.oregonstate.edu
+alliance-primo.hosted.exlibrisgroup.com
+/primo-explore/
+/fulldisplay?
+
+# ── Login / auth / SSO pages (no useful content, infinite session loops) ─────
+login.oregonstate.edu
+idp.oregonstate.edu
+cas.oregonstate.edu
+/login
+/logout
+/saml
+/sso
+/oauth
+/auth/
+
+# ── User-generated / profile pages (high volume, low knowledge value) ─────────
+# /users/
+# /user/
+# /profile/
+# /people/
+# /faculty-staff/  # individual staff pages are auto-generated at scale
+
+# ── Admin & internal tooling ─────────────────────────────────────────────────
+/admin/
+/wp-admin/
+/wp-login
+/wp-json/
+/wp-cron
+/xmlrpc.php
+?preview=true
+?p=         # WordPress draft preview links
+
+# ── Pagination (crawl the first page, skip deep archives) ────────────────────
+?page=
+?start=
+?paged=
+&paged=
+/page/2
+/page/3
+/page/4
+/page/5
+/page/6
+/page/7
+/page/8
+/page/9
+
+# ── Search result & filter pages (low unique content) ────────────────────────
+/search?
+?q=
+?s=
+?keyword=
+?filter=
+?sort=
+?view=list
+?view=grid
+
+# ── File download / streaming / media endpoints ───────────────────────────────
+/download/
+/stream/
+/media/download
+/files/
+/attachments/
+
+# ── Calendar & event feeds (infinite date-based URL space) ───────────────────
+/events/2019
+/events/2020
+/events/2021
+/events/2022
+/events/2023
+/events/2024
+/calendar/
+tribe_events
+?eventDisplay=
+ical=1
+?ical
+
+# ── News / blog archives (older than a few years, rarely queried) ─────────────
+/news/2018
+/news/2019
+/news/2020
+/news/2021
+/blog/2018
+/blog/2019
+/blog/2020
+/blog/2021
+
+# ── Tag / category / taxonomy archive pages ───────────────────────────────────
+/tag/
+/tags/
+/category/
+/categories/
+/topic/
+/topics/
+
+# ── Print / share / export views ─────────────────────────────────────────────
+?print=
+/print/
+?format=pdf
+?output=print
+share?
+
+# ── Tracking / redirect / campaign URLs ──────────────────────────────────────
+?utm_
+?fbclid=
+?gclid=
+?mc_eid=
+
+# ── Add additional exclusions below ──────────────────────────────────────────

@@ -38,11 +38,22 @@ load_dotenv()
 ROOT_DIR = Path(__file__).resolve().parent
 URLS_FILE = ROOT_DIR / "urls.txt"
 DISCOVERED_URLS_FILE = ROOT_DIR / "discovered_urls.json"
+EXCLUSIONS_FILE = ROOT_DIR / "url_exclusions.txt"
 
 CRAWL_MAX_DEPTH = int(os.environ.get("CRAWL_MAX_DEPTH", "3"))
 CRAWL_MAX_PAGES = int(os.environ.get("CRAWL_MAX_PAGES", "500"))
 CRAWL_DELAY = float(os.environ.get("CRAWL_DELAY", "1.0"))
 CRAWL_STRIP_QUERY = os.environ.get("CRAWL_STRIP_QUERY", "true").lower() == "true"
+
+# Pages with fewer than this many words after boilerplate removal are considered
+# "thin" — they are still recorded in JSON but their outbound links are NOT
+# enqueued, preventing stub/index pages from spawning huge BFS sub-trees.
+MIN_TEXT_WORDS = int(os.environ.get("CRAWL_MIN_WORDS", "80"))
+
+# Extra comma-separated exclusion patterns from environment (merged with exclusions file)
+CRAWL_EXCLUDE_ENV = [
+    p.strip() for p in os.environ.get("CRAWL_EXCLUDE_PATTERNS", "").split(",") if p.strip()
+]
 
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 2
@@ -97,10 +108,38 @@ def normalize_url(url: str) -> str:
 
 
 def should_skip_url(url: str) -> bool:
-    """Check if a URL points to a non-HTML resource."""
+    """Check if a URL points to a non-HTML resource by extension."""
     parsed = urlparse(url)
     path_lower = parsed.path.lower()
     return any(path_lower.endswith(ext) for ext in SKIP_EXTENSIONS)
+
+
+# Regex for low-quality URL segments: pure numeric IDs, UUIDs, hex hashes
+_NUMERIC_SLUG  = re.compile(r"/(\d{4,})(?:/|$)")
+_UUID_SLUG     = re.compile(r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:/|$)", re.I)
+_HEX_SLUG      = re.compile(r"/[0-9a-f]{24,}(?:/|$)", re.I)
+# Very deep paths (>= 8 segments) at crawl depth >1 are usually auto-generated
+_MAX_PATH_SEGS = 8
+
+
+def is_low_quality_url(url: str) -> str | None:
+    """
+    Cheap pre-fetch heuristic check. Returns a reason string if the URL looks
+    low-quality (should be skipped), or None if it looks fine.
+    """
+    parsed = urlparse(url)
+    path = parsed.path
+
+    if _NUMERIC_SLUG.search(path):
+        return "numeric-slug"
+    if _UUID_SLUG.search(path):
+        return "uuid-slug"
+    if _HEX_SLUG.search(path):
+        return "hex-slug"
+    segments = [s for s in path.split("/") if s]
+    if len(segments) >= _MAX_PATH_SEGS:
+        return f"path-too-deep ({len(segments)} segments)"
+    return None
 
 
 def load_seed_urls(path: Path = URLS_FILE) -> list[str]:
@@ -115,6 +154,33 @@ def load_seed_urls(path: Path = URLS_FILE) -> list[str]:
             if line and not line.startswith("#"):
                 urls.append(line)
     return urls
+
+
+def load_exclusions(path: Path = EXCLUSIONS_FILE) -> list[str]:
+    """
+    Load URL exclusion patterns from a text file.
+    Each non-comment line is treated as a substring/prefix that, if found
+    anywhere in a URL, causes that URL to be skipped.
+    Patterns from CRAWL_EXCLUDE_PATTERNS env var are merged in.
+    """
+    patterns: list[str] = list(CRAWL_EXCLUDE_ENV)  # start with env overrides
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    patterns.append(line)
+    return patterns
+
+
+# Module-level exclusions loaded once at import time
+_EXCLUSIONS: list[str] = load_exclusions()
+
+
+def is_excluded_url(url: str) -> bool:
+    """Return True if the URL matches any exclusion pattern."""
+    url_lower = url.lower()
+    return any(pat.lower() in url_lower for pat in _EXCLUSIONS)
 
 
 # ══════════════════════════════════════════════
@@ -265,6 +331,8 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
     log.info("OSU Web Crawler -- starting BFS crawl")
     log.info("  Seeds: %d | Max depth: %d | Max pages: %d | Delay: %.1fs",
              len(seed_urls), CRAWL_MAX_DEPTH, CRAWL_MAX_PAGES, CRAWL_DELAY)
+    if _EXCLUSIONS:
+        log.info("  Exclusion patterns: %d (see url_exclusions.txt)", len(_EXCLUSIONS))
     log.info("=" * 60)
 
     robots = RobotsChecker()
@@ -336,15 +404,37 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
         pages_crawled += 1
         domain_counts[domain] = domain_counts.get(domain, 0) + 1
 
-        # Extract links before storing so we can record link count
+        # ── Extract cleaned text to count words ──────────────────────
+        soup_body = BeautifulSoup(result.html, "lxml")
+        for tag in ("nav", "footer", "header", "script", "style", "noscript", "aside"):
+            for t in soup_body.find_all(tag):
+                t.decompose()
+        page_title = (soup_body.find("title") or type("_", (), {"get_text": lambda *_: ""})()).get_text(strip=True)
+        page_text  = soup_body.get_text(separator=" ")
+        word_count = len(page_text.split())
+        is_thin    = word_count < MIN_TEXT_WORDS
+
+        if is_thin:
+            log.debug("  [thin] %d words, skipping child links: %s", word_count, url)
+
+        # ── Extract and enqueue links (only from substantial pages) ──────
         new_links = 0
         new_cross_domain = 0
         links_found = 0
-        if depth < CRAWL_MAX_DEPTH:
+        if depth < CRAWL_MAX_DEPTH and not is_thin:
             links = extract_links(result.html, url)
             links_found = len(links)
             for link in links:
                 if link not in visited:
+                    lq_reason = is_low_quality_url(link)
+                    if lq_reason:
+                        log.debug("  [lq-url] %s -- %s", lq_reason, link)
+                        visited.add(link)
+                        continue
+                    if is_excluded_url(link):
+                        log.debug("  [excluded] %s", link)
+                        visited.add(link)  # mark visited so we don't re-check it
+                        continue
                     visited.add(link)
                     queue.append((link, depth + 1, url))  # url is the referrer
                     new_links += 1
@@ -362,6 +452,9 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
             "content_type":      result.content_type,
             "latency_ms":        result.latency_ms,
             "redirected":        result.redirected,
+            "word_count":        word_count,
+            "thin":              is_thin,
+            "title":             page_title,
             "links_found":       links_found,
             "new_links":         new_links,
             "new_cross_domain":  new_cross_domain,
@@ -369,9 +462,10 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
         }
 
         cross_note = f"  ({new_cross_domain} cross-domain)" if new_cross_domain else ""
-        log.info("  [%d/%d] d=%d  %dms  +%d links%s  %s",
-                 pages_crawled, CRAWL_MAX_PAGES, depth,
-                 result.latency_ms, new_links, cross_note, url)
+        if pages_crawled % 25 == 0 or pages_crawled <= 5:
+            log.info("  [%d/%d] d=%d  %dms  +%d links%s  %s",
+                     pages_crawled, CRAWL_MAX_PAGES, depth,
+                     result.latency_ms, new_links, cross_note, url)
 
         # Politeness delay
         time.sleep(CRAWL_DELAY)

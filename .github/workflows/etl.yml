@@ -48,9 +48,16 @@ jobs:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           FIRESTORE_COLLECTION: osu-knowledge
           CRAWL_MAX_DEPTH: "6"
-          CRAWL_MAX_PAGES: "100000"
-          CRAWL_DELAY: ".00001"
+          CRAWL_MAX_PAGES: "30000"
+          CRAWL_DELAY: ".0000001"
           CRAWL_STRIP_QUERY: "true"
+          # Extra ad-hoc exclusions on top of url_exclusions.txt (comma-separated substrings).
+          # Add permanent exclusions to url_exclusions.txt instead.
+          CRAWL_EXCLUDE_PATTERNS: ""
+          # Pages with fewer than this many words (after boilerplate removal) are
+          # recorded but their outbound links are NOT enqueued. Prevents stub/index
+          # pages from spawning large BFS sub-trees.
+          CRAWL_MIN_WORDS: "80"
         run: python etl_pipeline.py --crawl
 
       # ── 5. Upload crawl reports as artifacts ─────────────────────────────────
