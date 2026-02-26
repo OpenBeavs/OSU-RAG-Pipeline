@@ -48,7 +48,20 @@ jobs:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           FIRESTORE_COLLECTION: osu-knowledge
           CRAWL_MAX_DEPTH: "6"
-          CRAWL_MAX_PAGES: "20000"
+          CRAWL_MAX_PAGES: "100000"
           CRAWL_DELAY: ".00001"
           CRAWL_STRIP_QUERY: "true"
         run: python etl_pipeline.py --crawl
+
+      # ── 5. Upload crawl reports as artifacts ─────────────────────────────────
+      # discovered_urls.json  = per-page crawl report (latency, status, links, etc.)
+      # url_hashes.json       = dedup state (which pages were skipped vs re-embedded)
+      - name: Upload crawl report artifacts
+        if: always()   # upload even if the ETL step fails, so we can debug
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-report-${{ github.run_number }}
+          path: |
+            discovered_urls.json
+            url_hashes.json
+          retention-days: 30

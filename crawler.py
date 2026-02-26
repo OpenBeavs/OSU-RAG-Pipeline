@@ -19,6 +19,7 @@ import re
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -148,9 +149,22 @@ class RobotsChecker:
 # ══════════════════════════════════════════════
 # Fetcher
 # ══════════════════════════════════════════════
-def fetch_page(url: str) -> str | None:
-    """Fetch a page with retries. Returns HTML or None."""
+@dataclass
+class FetchResult:
+    """All metadata returned from a single page fetch."""
+    html:         str | None = None
+    status_code:  int | None = None
+    final_url:    str        = ""
+    content_type: str        = ""
+    latency_ms:   int        = 0
+    redirected:   bool       = False
+    error:        str | None = None
+
+
+def fetch_page(url: str) -> FetchResult:
+    """Fetch a page with retries. Returns a FetchResult."""
     for attempt in range(1, MAX_RETRIES + 1):
+        t0 = time.monotonic()
         try:
             resp = requests.get(
                 url,
@@ -158,22 +172,51 @@ def fetch_page(url: str) -> str | None:
                 headers={"User-Agent": USER_AGENT},
                 allow_redirects=True,
             )
-            resp.raise_for_status()
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            content_type = resp.headers.get("Content-Type", "")
+            final_url = resp.url
+            redirected = final_url.rstrip("/") != url.rstrip("/")
+
+            if resp.status_code >= 400:
+                return FetchResult(
+                    status_code=resp.status_code,
+                    final_url=final_url,
+                    content_type=content_type,
+                    latency_ms=latency_ms,
+                    redirected=redirected,
+                    error=f"HTTP {resp.status_code}",
+                )
 
             # Only process HTML responses
-            content_type = resp.headers.get("Content-Type", "")
             if "text/html" not in content_type:
                 log.debug("Skipping non-HTML: %s (%s)", url, content_type)
-                return None
+                return FetchResult(
+                    status_code=resp.status_code,
+                    final_url=final_url,
+                    content_type=content_type,
+                    latency_ms=latency_ms,
+                    redirected=redirected,
+                    error="non-html",
+                )
 
-            return resp.text
+            return FetchResult(
+                html=resp.text,
+                status_code=resp.status_code,
+                final_url=final_url,
+                content_type=content_type,
+                latency_ms=latency_ms,
+                redirected=redirected,
+            )
+
         except requests.RequestException as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
             wait = RETRY_BACKOFF ** attempt
             log.debug("Fetch attempt %d failed for %s: %s", attempt, url, exc)
-            time.sleep(wait)
-
-    log.warning("Failed to fetch: %s", url)
-    return None
+            if attempt < MAX_RETRIES:
+                time.sleep(wait)
+            else:
+                log.warning("Failed to fetch: %s", url)
+                return FetchResult(error=str(exc), latency_ms=latency_ms)
 
 
 # ══════════════════════════════════════════════
@@ -227,70 +270,170 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
     robots = RobotsChecker()
     visited: set[str] = set()
     discovered: dict[str, Any] = {}
-    queue: deque[tuple[str, int]] = deque()  # (url, depth)
+    failed: dict[str, Any] = {}
+    skipped_robots: list[str] = []
+    queue: deque[tuple[str, int, str]] = deque()  # (url, depth, referrer)
+
+    crawl_started_at = datetime.now(timezone.utc).isoformat()
 
     # Seed the queue
     for url in seed_urls:
         norm = normalize_url(url)
         if norm not in visited:
-            queue.append((norm, 0))
+            queue.append((norm, 0, "[seed]"))
             visited.add(norm)
 
     pages_crawled = 0
+    current_domain: str = ""
+    domain_counts: dict[str, int] = {}
 
     while queue and pages_crawled < CRAWL_MAX_PAGES:
-        url, depth = queue.popleft()
+        url, depth, referrer = queue.popleft()
+
+        # ── Domain-transition banner ──────────────────────────────
+        domain = urlparse(url).hostname or ""
+        if domain != current_domain:
+            log.info("")
+            log.info("── ▶  %s  (queue=%d, crawled=%d)",
+                     domain, len(queue), pages_crawled)
+            log.info("─" * 60)
+            current_domain = domain
 
         # Check robots.txt
         if not robots.can_fetch(url):
-            log.debug("Blocked by robots.txt: %s", url)
+            log.debug("  [robots] Blocked: %s", url)
+            skipped_robots.append(url)
             continue
 
         # Fetch
-        html = fetch_page(url)
-        if html is None:
+        result = fetch_page(url)
+
+        now_utc = datetime.now(timezone.utc).isoformat()
+
+        # Error / non-HTML → record in failed list, don’t count as crawled
+        if result.html is None:
+            # Only warn for real errors (4xx/5xx/network), not non-html skips
+            is_dead = result.error not in (None, "non-html")
+            if is_dead:
+                log.warning("  [DEAD] %s -- %s", result.error, url)
+                log.warning("         Linked from: %s", referrer)
+            else:
+                log.debug("  [skip] %s -- %s", result.error, url)
+            failed[url] = {
+                "depth":        depth,
+                "domain":       domain,
+                "status_code":  result.status_code,
+                "final_url":    result.final_url,
+                "content_type": result.content_type,
+                "latency_ms":   result.latency_ms,
+                "redirected":   result.redirected,
+                "error":        result.error,
+                "referrer":     referrer,
+                "attempted_at": now_utc,
+            }
             continue
 
         pages_crawled += 1
-        now_utc = datetime.now(timezone.utc).isoformat()
-        discovered[url] = {"depth": depth, "discovered_at": now_utc}
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
 
-        if pages_crawled % 25 == 0 or pages_crawled <= 5:
-            log.info("  [%d/%d] depth=%d %s",
-                     pages_crawled, CRAWL_MAX_PAGES, depth, url)
-
-        # Extract and enqueue links (if not at max depth)
+        # Extract links before storing so we can record link count
+        new_links = 0
+        new_cross_domain = 0
+        links_found = 0
         if depth < CRAWL_MAX_DEPTH:
-            links = extract_links(html, url)
-            new_links = 0
+            links = extract_links(result.html, url)
+            links_found = len(links)
             for link in links:
                 if link not in visited:
                     visited.add(link)
-                    queue.append((link, depth + 1))
+                    queue.append((link, depth + 1, url))  # url is the referrer
                     new_links += 1
+                    link_domain = urlparse(link).hostname or ""
+                    if link_domain != domain:
+                        new_cross_domain += 1
+            if new_links:
+                log.debug("    +%d new link(s) queued (%d cross-domain)", new_links, new_cross_domain)
+
+        discovered[url] = {
+            "depth":             depth,
+            "domain":            domain,
+            "status_code":       result.status_code,
+            "final_url":         result.final_url,
+            "content_type":      result.content_type,
+            "latency_ms":        result.latency_ms,
+            "redirected":        result.redirected,
+            "links_found":       links_found,
+            "new_links":         new_links,
+            "new_cross_domain":  new_cross_domain,
+            "crawled_at":        now_utc,
+        }
+
+        cross_note = f"  ({new_cross_domain} cross-domain)" if new_cross_domain else ""
+        log.info("  [%d/%d] d=%d  %dms  +%d links%s  %s",
+                 pages_crawled, CRAWL_MAX_PAGES, depth,
+                 result.latency_ms, new_links, cross_note, url)
 
         # Politeness delay
         time.sleep(CRAWL_DELAY)
 
-    # Save results
+    crawl_ended_at = datetime.now(timezone.utc).isoformat()
+
+    # ── Build domain summary for JSON ────────────────────────────
+    domain_summary: dict[str, Any] = {}
+    for url_entry, meta in discovered.items():
+        d = meta["domain"]
+        if d not in domain_summary:
+            domain_summary[d] = {
+                "pages": 0,
+                "avg_latency_ms": 0,
+                "total_latency_ms": 0,
+                "redirected_count": 0,
+            }
+        domain_summary[d]["pages"] += 1
+        domain_summary[d]["total_latency_ms"] += meta["latency_ms"]
+        if meta["redirected"]:
+            domain_summary[d]["redirected_count"] += 1
+    for d, ds in domain_summary.items():
+        ds["avg_latency_ms"] = round(ds["total_latency_ms"] / ds["pages"], 1)
+        del ds["total_latency_ms"]
+
+    # ── Save results ────────────────────────────────────────
     output = {
         "crawl_metadata": {
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "seed_urls": seed_urls,
-            "max_depth": CRAWL_MAX_DEPTH,
-            "max_pages": CRAWL_MAX_PAGES,
-            "pages_crawled": pages_crawled,
-            "total_discovered": len(discovered),
+            "started_at":      crawl_started_at,
+            "ended_at":        crawl_ended_at,
+            "seed_urls":       seed_urls,
+            "config": {
+                "max_depth":       CRAWL_MAX_DEPTH,
+                "max_pages":       CRAWL_MAX_PAGES,
+                "crawl_delay_s":   CRAWL_DELAY,
+                "strip_query":     CRAWL_STRIP_QUERY,
+            },
+            "summary": {
+                "pages_crawled":   pages_crawled,
+                "pages_failed":    len(failed),
+                "pages_skipped_robots": len(skipped_robots),
+                "urls_discovered": len(visited),
+            },
+            "pages_by_domain": domain_counts,
         },
-        "urls": discovered,
+        "domain_summary":   domain_summary,
+        "urls":             discovered,
+        "failed":           failed,
+        "skipped_robots":   skipped_robots,
     }
 
     with open(DISCOVERED_URLS_FILE, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
 
+    log.info("")
     log.info("=" * 60)
-    log.info("Crawl complete -- %d pages crawled, %d URLs discovered",
-             pages_crawled, len(discovered))
+    log.info("Crawl complete -- %d pages crawled, %d failed, %d robot-blocked",
+             pages_crawled, len(failed), len(skipped_robots))
+    log.info("Pages by domain:")
+    for d, count in sorted(domain_counts.items(), key=lambda x: -x[1]):
+        info = domain_summary[d]
+        log.info("  %-45s  %4d page(s)  avg %dms", d, count, info["avg_latency_ms"])
     log.info("Results saved to %s", DISCOVERED_URLS_FILE)
     log.info("=" * 60)
 
