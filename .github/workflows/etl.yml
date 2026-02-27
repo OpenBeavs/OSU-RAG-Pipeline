@@ -3,7 +3,7 @@ name: OSU RAG ETL Pipeline
 on:
   # Run automatically every 6 hours to keep the knowledge base fresh
   schedule:
-    - cron: "0 */12 * * *"
+    - cron: "0 */24 * * *"
 
   # Also run on every push to main (e.g. config changes take effect immediately)
   push:
@@ -48,12 +48,13 @@ jobs:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           FIRESTORE_COLLECTION: osu-knowledge
           CRAWL_MAX_DEPTH: "6"
-          CRAWL_MAX_PAGES: "30000"
+          CRAWL_MAX_PAGES: "10000"
           CRAWL_DELAY: ".0000001"
           CRAWL_STRIP_QUERY: "true"
           # Extra ad-hoc exclusions on top of url_exclusions.txt (comma-separated substrings).
           # Add permanent exclusions to url_exclusions.txt instead.
           CRAWL_EXCLUDE_PATTERNS: ""
+          BASE_URL_TO_SCRAPE: "oregonstate.edu"
           # Pages with fewer than this many words (after boilerplate removal) are
           # recorded but their outbound links are NOT enqueued. Prevents stub/index
           # pages from spawning large BFS sub-trees.

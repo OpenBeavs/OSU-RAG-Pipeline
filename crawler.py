@@ -45,6 +45,20 @@ CRAWL_MAX_PAGES = int(os.environ.get("CRAWL_MAX_PAGES", "500"))
 CRAWL_DELAY = float(os.environ.get("CRAWL_DELAY", "1.0"))
 CRAWL_STRIP_QUERY = os.environ.get("CRAWL_STRIP_QUERY", "true").lower() == "true"
 
+# Set to "false" to disable robots.txt checking entirely (useful for sites
+# that redirect the robots.txt fetch to a login page, blocking all crawling).
+CRAWL_RESPECT_ROBOTS = os.environ.get("CRAWL_RESPECT_ROBOTS", "true").lower() == "true"
+
+# Comma-separated domains to bypass robots.txt checking even when
+# CRAWL_RESPECT_ROBOTS is true.  Example: "advantage.oregonstate.edu"
+CRAWL_ROBOTS_IGNORE_DOMAINS: set[str] = {
+    d.strip().lower()
+    for d in os.environ.get("CRAWL_ROBOTS_IGNORE_DOMAINS", "").split(",")
+    if d.strip()
+}
+
+BASE_URL_TO_SCRAPE = os.environ.get("BASE_URL_TO_SCRAPE", "oregonstate.edu")
+
 # Pages with fewer than this many words after boilerplate removal are considered
 # "thin" — they are still recorded in JSON but their outbound links are NOT
 # enqueued, preventing stub/index pages from spawning huge BFS sub-trees.
@@ -86,10 +100,10 @@ log = logging.getLogger("osu-crawler")
 # URL Helpers
 # ══════════════════════════════════════════════
 def is_oregonstate_url(url: str) -> bool:
-    """Check if a URL belongs to *.oregonstate.edu."""
+    """Check if a URL belongs to *.oregonstate.edu (or BASE_URL_TO_SCRAPE)."""
     parsed = urlparse(url)
     host = parsed.hostname or ""
-    return host == "oregonstate.edu" or host.endswith(".oregonstate.edu")
+    return host == BASE_URL_TO_SCRAPE or host.endswith("." + BASE_URL_TO_SCRAPE)
 
 
 def normalize_url(url: str) -> str:
@@ -193,8 +207,17 @@ class RobotsChecker:
         self._cache: dict[str, RobotFileParser] = {}
 
     def can_fetch(self, url: str) -> bool:
+        # Global bypass
+        if not CRAWL_RESPECT_ROBOTS:
+            return True
+
         parsed = urlparse(url)
+        domain = (parsed.hostname or "").lower()
         origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        # Per-domain bypass
+        if domain in CRAWL_ROBOTS_IGNORE_DOMAINS:
+            return True
 
         if origin not in self._cache:
             rp = RobotFileParser()
@@ -202,6 +225,15 @@ class RobotsChecker:
             try:
                 rp.set_url(robots_url)
                 rp.read()
+                # Sanity-check: if the parser blocks everything including the root,
+                # the robots.txt was likely a login redirect page — treat as allow-all.
+                if not rp.can_fetch("*", origin + "/"):
+                    log.debug(
+                        "robots.txt for %s blocks root — likely a login redirect, allowing",
+                        origin,
+                    )
+                    rp = RobotFileParser()
+                    rp.allow_all = True
             except Exception:
                 # If robots.txt is unreachable, allow crawling
                 log.debug("Could not fetch robots.txt for %s -- allowing", origin)
