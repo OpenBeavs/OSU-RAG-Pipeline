@@ -1,4 +1,3 @@
 # OSU URLs to index — one per line
 # Lines starting with # are ignored.
-https://advantage.oregonstate.edu/
-https://advantage.oregonstate.edu/directory
+https://oregonstate.edu/

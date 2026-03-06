@@ -6,12 +6,19 @@ Scrapes *.oregonstate.edu pages, chunks the text, generates embeddings via
 Google GenAI (gemini-embedding-001), and upserts them into Firestore
 with vector search support.
 
-Designed to run as a cron job every 6 hours.  Content-hash deduplication
-ensures only changed pages are re-processed, and stale vectors are deleted
-before new ones are upserted.
+Performance features:
+  - Parallel URL processing via ThreadPoolExecutor (ETL_MAX_WORKERS workers)
+  - Thread-safe StateManager with per-URL locking
+  - Skips re-fetching pages whose text was already cached by crawler.py
+  - Batched Firestore deletes (no more one-doc-at-a-time loop)
+
+Designed to run as a cron job. Content-hash deduplication ensures only
+changed pages are re-processed, and stale vectors are deleted before new
+ones are upserted.
 
 Usage:
-    python etl_pipeline.py                 # full run
+    python etl_pipeline.py                 # full run (reads urls.txt)
+    python etl_pipeline.py --crawl         # crawl first, then embed
     python etl_pipeline.py --dry-run       # skip embedding & Firestore calls
 
 Environment variables (see .env.example):
@@ -26,7 +33,9 @@ import json
 import logging
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,21 +53,25 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 # ──────────────────────────────────────────────
 load_dotenv()
 
-ROOT_DIR = Path(__file__).resolve().parent
-HASH_STORE_PATH = ROOT_DIR / "url_hashes.json"
-URLS_FILE = ROOT_DIR / "urls.txt"
+ROOT_DIR            = Path(__file__).resolve().parent
+HASH_STORE_PATH     = ROOT_DIR / "url_hashes.json"
+URLS_FILE           = ROOT_DIR / "urls.txt"
 DISCOVERED_URLS_FILE = ROOT_DIR / "discovered_urls.json"
 
-EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_MODEL     = "gemini-embedding-001"
 EMBEDDING_DIMENSION = 768
 EMBEDDING_BATCH_SIZE = 100          # Google GenAI max per request
 
-CHUNK_SIZE = 512                    # tokens
-CHUNK_OVERLAP = 64                  # tokens
+CHUNK_SIZE          = 512           # tokens
+CHUNK_OVERLAP       = 64            # tokens
 
-REQUEST_TIMEOUT = 30                # seconds
-MAX_RETRIES = 3
-RETRY_BACKOFF = 2                   # seconds (exponential base)
+REQUEST_TIMEOUT     = 30            # seconds
+MAX_RETRIES         = 3
+RETRY_BACKOFF       = 2             # seconds (exponential base)
+
+# How many URLs to process in parallel
+import os as _os
+ETL_MAX_WORKERS = int(_os.environ.get("ETL_MAX_WORKERS", "10"))
 
 # Tags whose entire subtree is stripped from the HTML before text extraction.
 BOILERPLATE_TAGS: list[str] = [
@@ -82,10 +95,14 @@ log = logging.getLogger("osu-rag-etl")
 # 1.  State Management (Deduplication)
 # ══════════════════════════════════════════════
 class StateManager:
-    """Persists `{url: content_hash}` to a local JSON file."""
+    """
+    Persists `{url: content_hash}` to a local JSON file.
+    Thread-safe: all mutations go through an internal lock.
+    """
 
     def __init__(self, path: Path = HASH_STORE_PATH) -> None:
-        self.path = path
+        self.path   = path
+        self._lock  = threading.Lock()
         self.hashes: dict[str, str] = self._load()
 
     # --- persistence ---
@@ -96,8 +113,9 @@ class StateManager:
         return {}
 
     def save(self) -> None:
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(self.hashes, f, indent=2)
+        with self._lock:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.hashes, f, indent=2)
 
     # --- hash helpers ---
     @staticmethod
@@ -105,10 +123,12 @@ class StateManager:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     def has_changed(self, url: str, content_hash: str) -> bool:
-        return self.hashes.get(url) != content_hash
+        with self._lock:
+            return self.hashes.get(url) != content_hash
 
     def update(self, url: str, content_hash: str) -> None:
-        self.hashes[url] = content_hash
+        with self._lock:
+            self.hashes[url] = content_hash
 
 
 # ══════════════════════════════════════════════
@@ -145,16 +165,13 @@ def clean_and_extract(html: str) -> tuple[str, str]:
     """
     soup = BeautifulSoup(html, "lxml")
 
-    # Extract title
     title_tag = soup.find("title")
     title = title_tag.get_text(strip=True) if title_tag else "Untitled"
 
-    # Remove boilerplate subtrees
     for tag_name in BOILERPLATE_TAGS:
         for tag in soup.find_all(tag_name):
             tag.decompose()
 
-    # Collapse whitespace
     text = soup.get_text(separator="\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]+", " ", text)
@@ -187,7 +204,7 @@ def embed_chunks(client: genai.Client, chunks: list[str]) -> list[list[float]]:
     all_embeddings: list[list[float]] = []
 
     for i in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
-        batch = chunks[i : i + EMBEDDING_BATCH_SIZE]
+        batch  = chunks[i : i + EMBEDDING_BATCH_SIZE]
         result = client.models.embed_content(
             model=EMBEDDING_MODEL,
             contents=batch,
@@ -208,18 +225,28 @@ def _url_id_prefix(url: str) -> str:
 
 def delete_old_vectors(collection: Any, url: str) -> int:
     """
-    Delete all existing documents for a URL using url_hash field query.
+    Delete all existing documents for a URL using batched Firestore writes.
+    Much faster than one-at-a-time deletes.
     Returns the count of deleted documents.
     """
     url_hash = _url_id_prefix(url)
+    docs     = list(collection.where("url_hash", "==", url_hash).stream())
+
+    if not docs:
+        return 0
+
     deleted = 0
+    batch   = collection._client.batch()
 
-    # Query for all docs belonging to this URL
-    docs = collection.where("url_hash", "==", url_hash).stream()
-    for doc in docs:
-        doc.reference.delete()
+    for i, doc in enumerate(docs):
+        batch.delete(doc.reference)
         deleted += 1
+        # Firestore batch limit is 500 writes; commit and start a fresh batch
+        if (i + 1) % 499 == 0:
+            batch.commit()
+            batch = collection._client.batch()
 
+    batch.commit()
     return deleted
 
 
@@ -235,20 +262,20 @@ def upsert_vectors(
     Returns count of upserted documents.
     """
     url_hash = _url_id_prefix(url)
-    now_utc = datetime.now(timezone.utc).isoformat()
-    batch = collection._client.batch()
+    now_utc  = datetime.now(timezone.utc).isoformat()
+    batch    = collection._client.batch()
 
     for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-        doc_id = f"{url_hash}#{i}"
+        doc_id  = f"{url_hash}#{i}"
         doc_ref = collection.document(doc_id)
         batch.set(doc_ref, {
-            "url": url,
-            "title": title,
-            "text": chunk,
+            "url":          url,
+            "title":        title,
+            "text":         chunk,
             "last_crawled": now_utc,
-            "url_hash": url_hash,
-            "chunk_index": i,
-            "embedding": Vector(emb),
+            "url_hash":     url_hash,
+            "chunk_index":  i,
+            "embedding":    Vector(emb),
         })
 
         # Firestore batch limit is 500 writes
@@ -277,34 +304,123 @@ def load_urls(path: Path = URLS_FILE) -> list[str]:
     return urls
 
 
-def load_discovered_urls(path: Path = DISCOVERED_URLS_FILE) -> list[str]:
-    """Load URLs from the crawler's discovered_urls.json output."""
+def load_discovered_urls(path: Path = DISCOVERED_URLS_FILE) -> dict[str, dict[str, Any]]:
+    """
+    Load URLs from the crawler's discovered_urls.json output.
+
+    Returns a dict mapping url → {text, title, ...} so the ETL pipeline
+    can skip re-fetching pages that were already captured during crawling.
+    Only non-thin pages with cached text are included.
+    """
     if not path.exists():
         log.error("Discovered URLs file not found: %s", path)
-        return []
+        return {}
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    urls = list(data.get("urls", {}).keys())
-    return urls
+    url_entries: dict[str, Any] = data.get("urls", {})
+    return url_entries
 
 
 # ══════════════════════════════════════════════
-# 8.  Main Pipeline
+# 8.  Per-URL Worker
+# ══════════════════════════════════════════════
+def _process_url(
+    url:          str,
+    cached_meta:  dict[str, Any] | None,
+    state:        StateManager,
+    genai_client: genai.Client | None,
+    fs_collection: Any,
+    dry_run:      bool,
+    idx:          int,
+    total:        int,
+) -> dict[str, Any]:
+    """
+    Process a single URL through the full ETL pipeline.
+    Safe to call from multiple threads simultaneously.
+
+    Returns a stats dict: {"status": "updated"|"skipped"|"failed", "vectors": int}
+    """
+    log.info("[%d/%d] Processing: %s", idx, total, url)
+
+    # ── Fetch or use cached text ─────────────────────────────────────────────
+    cached_text  = (cached_meta or {}).get("text") or ""
+    cached_title = (cached_meta or {}).get("title") or ""
+
+    if cached_text:
+        # Crawler already fetched this page — skip the network round-trip
+        title = cached_title or "Untitled"
+        text  = cached_text
+        log.info("  -> Using cached text from crawler (%d words)", len(text.split()))
+    else:
+        html = fetch_page(url)
+        if html is None:
+            return {"status": "failed", "vectors": 0}
+        title, text = clean_and_extract(html)
+
+    # ── Dedup check ──────────────────────────────────────────────────────────
+    content_hash = StateManager.compute_hash(text)
+    if not state.has_changed(url, content_hash):
+        log.info("  -> No Change -- skipping (hash match)")
+        return {"status": "skipped", "vectors": 0}
+
+    if not text:
+        log.warning("  -> No extractable text -- skipping")
+        return {"status": "failed", "vectors": 0}
+
+    # ── Chunk ────────────────────────────────────────────────────────────────
+    chunks = chunk_text(text)
+    log.info("  -> Title: %s | Chunks: %d", title, len(chunks))
+
+    if dry_run:
+        log.info("  -> [DRY-RUN] Would embed %d chunks & upsert to Firestore", len(chunks))
+        state.update(url, content_hash)
+        return {"status": "updated", "vectors": 0}
+
+    # ── Embed ────────────────────────────────────────────────────────────────
+    assert genai_client is not None
+    try:
+        embeddings = embed_chunks(genai_client, chunks)
+    except Exception as exc:
+        log.error("  -> Embedding failed: %s -- skipping", exc)
+        return {"status": "failed", "vectors": 0}
+
+    # ── Firestore write ──────────────────────────────────────────────────────
+    assert fs_collection is not None
+    try:
+        deleted = delete_old_vectors(fs_collection, url)
+        if deleted:
+            log.info("  -> Deleted %d stale document(s)", deleted)
+
+        count = upsert_vectors(fs_collection, url, title, chunks, embeddings)
+        log.info("  -> Upserted %d document(s)", count)
+    except Exception as exc:
+        log.error("  -> Firestore operation failed: %s -- skipping", exc)
+        return {"status": "failed", "vectors": 0}
+
+    # ── Persist hash ─────────────────────────────────────────────────────────
+    state.update(url, content_hash)
+    return {"status": "updated", "vectors": count}
+
+
+# ══════════════════════════════════════════════
+# 9.  Main Pipeline
 # ══════════════════════════════════════════════
 def run_pipeline(dry_run: bool = False, use_crawler: bool = False) -> None:
-    """Execute the full ETL pipeline."""
+    """Execute the full ETL pipeline with parallel URL processing."""
     log.info("=" * 60)
-    log.info("OSU RAG ETL Pipeline -- starting run")
+    log.info("OSU RAG ETL Pipeline -- starting run (workers=%d)", ETL_MAX_WORKERS)
     log.info("=" * 60)
 
     # --- crawl (if requested) ---
+    url_cache: dict[str, dict[str, Any]] = {}
     if use_crawler:
         from crawler import crawl
         crawl()
-        urls = load_discovered_urls()
-        source = DISCOVERED_URLS_FILE
+        url_cache = load_discovered_urls()
+        urls      = list(url_cache.keys())
+        source    = DISCOVERED_URLS_FILE
     else:
-        urls = load_urls()
+        urls   = load_urls()
         source = URLS_FILE
 
     if not urls:
@@ -316,14 +432,14 @@ def run_pipeline(dry_run: bool = False, use_crawler: bool = False) -> None:
     state = StateManager()
 
     # --- init external clients (skip in dry-run) ---
-    genai_client: genai.Client | None = None
-    fs_collection: Any = None
+    genai_client:  genai.Client | None = None
+    fs_collection: Any                 = None
 
     if not dry_run:
         import os
 
-        google_api_key = os.environ.get("GOOGLE_API_KEY")
-        gcp_project_id = os.environ.get("GCP_PROJECT_ID")
+        google_api_key     = os.environ.get("GOOGLE_API_KEY")
+        gcp_project_id     = os.environ.get("GCP_PROJECT_ID")
         firestore_collection = os.environ.get("FIRESTORE_COLLECTION", "osu-knowledge")
 
         if not google_api_key:
@@ -333,73 +449,41 @@ def run_pipeline(dry_run: bool = False, use_crawler: bool = False) -> None:
             log.error("GCP_PROJECT_ID not set. Aborting.")
             sys.exit(1)
 
-        genai_client = genai.Client(api_key=google_api_key)
-        fs_client = firestore.Client(project=gcp_project_id)
+        genai_client  = genai.Client(api_key=google_api_key)
+        fs_client     = firestore.Client(project=gcp_project_id)
         fs_collection = fs_client.collection(firestore_collection)
         log.info("Connected to Firestore collection: %s", firestore_collection)
 
-    # --- process each URL ---
+    # --- parallel processing ---
     stats = {"skipped": 0, "updated": 0, "failed": 0, "vectors_upserted": 0}
+    total = len(urls)
 
-    for i, url in enumerate(urls, 1):
-        log.info("[%d/%d] Processing: %s", i, len(urls), url)
+    with ThreadPoolExecutor(max_workers=ETL_MAX_WORKERS) as executor:
+        future_to_url = {
+            executor.submit(
+                _process_url,
+                url,
+                url_cache.get(url),    # pass cached text/title if available
+                state,
+                genai_client,
+                fs_collection,
+                dry_run,
+                idx,
+                total,
+            ): url
+            for idx, url in enumerate(urls, 1)
+        }
 
-        # Fetch
-        html = fetch_page(url)
-        if html is None:
-            stats["failed"] += 1
-            continue
+        for future in as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                log.error("Unhandled error processing %s: %s", url, exc)
+                result = {"status": "failed", "vectors": 0}
 
-        # Clean & extract text first so the hash reflects meaningful content,
-        # not raw HTML noise (timestamps, session tokens, nav changes, etc.).
-        title, text = clean_and_extract(html)
-
-        # Dedup check on cleaned text
-        content_hash = StateManager.compute_hash(text)
-        if not state.has_changed(url, content_hash):
-            log.info("  -> No Change -- skipping (hash match)")
-            stats["skipped"] += 1
-            continue
-        if not text:
-            log.warning("  -> No extractable text -- skipping")
-            stats["failed"] += 1
-            continue
-
-        chunks = chunk_text(text)
-        log.info("  -> Title: %s | Chunks: %d", title, len(chunks))
-        if dry_run:
-            log.info("  -> [DRY-RUN] Would embed %d chunks & upsert to Firestore", len(chunks))
-            state.update(url, content_hash)
-            stats["updated"] += 1
-            continue
-
-        # Embed
-        assert genai_client is not None
-        try:
-            embeddings = embed_chunks(genai_client, chunks)
-        except Exception as exc:
-            log.error("  -> Embedding failed: %s -- skipping", exc)
-            stats["failed"] += 1
-            continue
-
-        # Delete old documents, then upsert new ones
-        assert fs_collection is not None
-        try:
-            deleted = delete_old_vectors(fs_collection, url)
-            if deleted:
-                log.info("  -> Deleted %d stale document(s)", deleted)
-
-            count = upsert_vectors(fs_collection, url, title, chunks, embeddings)
-            log.info("  -> Upserted %d document(s)", count)
-            stats["vectors_upserted"] += count
-        except Exception as exc:
-            log.error("  -> Firestore operation failed: %s -- skipping", exc)
-            stats["failed"] += 1
-            continue
-
-        # Persist hash
-        state.update(url, content_hash)
-        stats["updated"] += 1
+            stats[result["status"]] += 1
+            stats["vectors_upserted"] += result.get("vectors", 0)
 
     # --- save state ---
     state.save()
@@ -425,7 +509,7 @@ def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run the pipeline without calling external APIs (embedding & Pinecone).",
+        help="Run the pipeline without calling external APIs (embedding & Firestore).",
     )
     parser.add_argument(
         "--crawl",

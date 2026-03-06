@@ -1,29 +1,52 @@
 name: OSU RAG ETL Pipeline
 
 on:
-  # Run automatically every 6 hours to keep the knowledge base fresh
+  # Refresh the knowledge base daily
   schedule:
-    - cron: "0 */24 * * *"
+    - cron: "0 6 * * *"
 
-  # Also run on every push to main (e.g. config changes take effect immediately)
+  # Config changes take effect immediately on push to main
   push:
     branches:
       - main
 
   # Allow manual runs from the GitHub Actions UI
   workflow_dispatch:
+    inputs:
+      crawl_max_pages:
+        description: "Max pages to crawl (default: 2000)"
+        required: false
+        default: "2000"
+      crawl_max_depth:
+        description: "Max crawl depth (default: 3)"
+        required: false
+        default: "3"
+      crawl_max_workers:
+        description: "Parallel crawl workers (default: 20)"
+        required: false
+        default: "20"
+      etl_max_workers:
+        description: "Parallel ETL workers (default: 10)"
+        required: false
+        default: "10"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1: Crawl
+# Discovers all OSU pages using the parallel BFS crawler and saves the results
+# as a GitHub Actions artifact.  Each job has its own 6-hour budget, so
+# splitting crawl + embed gives us up to 12 hours total when needed.
+# ─────────────────────────────────────────────────────────────────────────────
 jobs:
-  run-etl:
-    name: Crawl & Embed OSU Pages
+  crawl:
+    name: "🕷️ Crawl OSU Pages"
     runs-on: ubuntu-latest
 
     steps:
-      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Python ────────────────────────────────────────────────────────────
+      # ── 2. Python ──────────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -33,43 +56,157 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── 3. GCP Auth ──────────────────────────────────────────────────────────
-      # Authenticates using a Service Account JSON stored as a GitHub secret.
-      # The SA needs roles: roles/datastore.user (Firestore read/write)
+      # ── 3. Run crawler ─────────────────────────────────────────────────────
+      - name: Run parallel BFS crawler
+        env:
+          # Tuned defaults: depth 3 covers all meaningful OSU content without
+          # the exponential blowup of depth 6. 2000 pages is a comprehensive
+          # starting point; increase via workflow_dispatch input if needed.
+          CRAWL_MAX_DEPTH:    ${{ github.event.inputs.crawl_max_depth   || '3' }}
+          CRAWL_MAX_PAGES:    ${{ github.event.inputs.crawl_max_pages   || '2000' }}
+          CRAWL_MAX_WORKERS:  ${{ github.event.inputs.crawl_max_workers || '20' }}
+          CRAWL_DELAY:        "0.25"
+          CRAWL_STRIP_QUERY:  "true"
+          CRAWL_MIN_WORDS:    "80"
+          BASE_URL_TO_SCRAPE: "oregonstate.edu"
+          CRAWL_EXCLUDE_PATTERNS: ""
+        run: python crawler.py
+
+      # ── 4. Upload crawl output ─────────────────────────────────────────────
+      # discovered_urls.json contains per-page metadata AND cached text/title
+      # so the embed job can skip re-fetching every page.
+      - name: Upload crawl output
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-output-${{ github.run_number }}
+          path: discovered_urls.json
+          retention-days: 7
+
+      # ── 5. Quick crawl summary ─────────────────────────────────────────────
+      - name: Print crawl summary
+        if: always()
+        run: |
+          python - <<'EOF'
+          import json, pathlib, sys
+
+          p = pathlib.Path("discovered_urls.json")
+          if not p.exists():
+              print("discovered_urls.json not found — crawl may have failed.")
+              sys.exit(0)
+
+          data = json.loads(p.read_text())
+          meta = data.get("crawl_metadata", {})
+          summary = meta.get("summary", {})
+          by_domain = meta.get("pages_by_domain", {})
+          domain_summary = data.get("domain_summary", {})
+
+          print("=" * 60)
+          print("CRAWL SUMMARY")
+          print("=" * 60)
+          print(f"  Started:          {meta.get('started_at', 'N/A')}")
+          print(f"  Ended:            {meta.get('ended_at',   'N/A')}")
+          print(f"  Pages crawled:    {summary.get('pages_crawled', 0)}")
+          print(f"  Pages failed:     {summary.get('pages_failed', 0)}")
+          print(f"  Robot-blocked:    {summary.get('pages_skipped_robots', 0)}")
+          print(f"  URLs discovered:  {summary.get('urls_discovered', 0)}")
+          print()
+          print("  Pages by domain (top 15):")
+          top = sorted(by_domain.items(), key=lambda x: -x[1])[:15]
+          for domain, count in top:
+              avg = domain_summary.get(domain, {}).get("avg_latency_ms", 0)
+              print(f"    {domain:<45}  {count:>5} page(s)  avg {avg:.0f}ms")
+          print("=" * 60)
+          EOF
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 2: Embed & Upsert
+# Downloads the crawl output and runs the parallel ETL pipeline.  Pages whose
+# text was cached by the crawler are processed without any re-fetching.
+# ─────────────────────────────────────────────────────────────────────────────
+  embed:
+    name: "🧠 Embed & Upsert to Firestore"
+    needs: crawl
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ──────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 3. GCP Auth ────────────────────────────────────────────────────────
+      # SA needs: roles/datastore.user (Firestore read/write)
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      # ── 4. Run ETL ───────────────────────────────────────────────────────────
-      - name: Run ETL pipeline
-        env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          FIRESTORE_COLLECTION: osu-knowledge
-          CRAWL_MAX_DEPTH: "6"
-          CRAWL_MAX_PAGES: "10000"
-          CRAWL_DELAY: ".0000001"
-          CRAWL_STRIP_QUERY: "true"
-          # Extra ad-hoc exclusions on top of url_exclusions.txt (comma-separated substrings).
-          # Add permanent exclusions to url_exclusions.txt instead.
-          CRAWL_EXCLUDE_PATTERNS: ""
-          BASE_URL_TO_SCRAPE: "oregonstate.edu"
-          # Pages with fewer than this many words (after boilerplate removal) are
-          # recorded but their outbound links are NOT enqueued. Prevents stub/index
-          # pages from spawning large BFS sub-trees.
-          CRAWL_MIN_WORDS: "80"
-        run: python etl_pipeline.py --crawl
+      # ── 4. Download crawl output ───────────────────────────────────────────
+      - name: Download crawl output
+        uses: actions/download-artifact@v4
+        with:
+          name: crawl-output-${{ github.run_number }}
 
-      # ── 5. Upload crawl reports as artifacts ─────────────────────────────────
-      # discovered_urls.json  = per-page crawl report (latency, status, links, etc.)
-      # url_hashes.json       = dedup state (which pages were skipped vs re-embedded)
-      - name: Upload crawl report artifacts
-        if: always()   # upload even if the ETL step fails, so we can debug
+      # ── 5. Run ETL pipeline ────────────────────────────────────────────────
+      - name: Run parallel ETL pipeline
+        env:
+          GOOGLE_API_KEY:       ${{ secrets.GOOGLE_API_KEY }}
+          GCP_PROJECT_ID:       ${{ secrets.GCP_PROJECT_ID }}
+          FIRESTORE_COLLECTION: osu-knowledge
+          ETL_MAX_WORKERS:      ${{ github.event.inputs.etl_max_workers || '10' }}
+        # Reads discovered_urls.json (with cached text) — no re-crawling needed
+        run: python etl_pipeline.py
+
+      # ── 6. Upload dedup state ──────────────────────────────────────────────
+      - name: Upload dedup state & crawl report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crawl-report-${{ github.run_number }}
+          name: etl-report-${{ github.run_number }}
           path: |
-            discovered_urls.json
             url_hashes.json
+            discovered_urls.json
           retention-days: 30
+
+      # ── 7. ETL summary ─────────────────────────────────────────────────────
+      - name: Print ETL summary
+        if: always()
+        run: |
+          python - <<'EOF'
+          import json, pathlib, sys
+
+          hashes_path = pathlib.Path("url_hashes.json")
+          crawl_path  = pathlib.Path("discovered_urls.json")
+
+          print("=" * 60)
+          print("ETL SUMMARY")
+          print("=" * 60)
+
+          if hashes_path.exists():
+              hashes = json.loads(hashes_path.read_text())
+              print(f"  URLs with stored hashes (dedup state): {len(hashes)}")
+          else:
+              print("  url_hashes.json not found.")
+
+          if crawl_path.exists():
+              data    = json.loads(crawl_path.read_text())
+              urls    = data.get("urls", {})
+              total   = len(urls)
+              thin    = sum(1 for v in urls.values() if v.get("thin"))
+              cached  = sum(1 for v in urls.values() if v.get("text"))
+              print(f"  Total discovered URLs:  {total}")
+              print(f"  Thin pages (skipped):   {thin}")
+              print(f"  Pages with cached text: {cached}  (no re-fetch needed)")
+              print(f"  Expected embed targets: {total - thin}")
+
+          print("=" * 60)
+          EOF

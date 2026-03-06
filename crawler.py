@@ -5,9 +5,13 @@ OSU Web Crawler
 BFS web spider that discovers all reachable pages within *.oregonstate.edu,
 starting from seed URLs in urls.txt.
 
-Outputs discovered_urls.json with all found URLs and metadata.
+Outputs discovered_urls.json with all found URLs, metadata, AND cached page
+text/title so the ETL pipeline can skip re-fetching.
 
 Can be used standalone or called from etl_pipeline.py via --crawl flag.
+
+Performance: uses a ThreadPoolExecutor for parallel fetching with per-domain
+rate limiting so we stay polite without slowing down cross-domain crawls.
 """
 
 from __future__ import annotations
@@ -17,8 +21,10 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,10 +46,11 @@ URLS_FILE = ROOT_DIR / "urls.txt"
 DISCOVERED_URLS_FILE = ROOT_DIR / "discovered_urls.json"
 EXCLUSIONS_FILE = ROOT_DIR / "url_exclusions.txt"
 
-CRAWL_MAX_DEPTH = int(os.environ.get("CRAWL_MAX_DEPTH", "3"))
-CRAWL_MAX_PAGES = int(os.environ.get("CRAWL_MAX_PAGES", "500"))
-CRAWL_DELAY = float(os.environ.get("CRAWL_DELAY", "1.0"))
+CRAWL_MAX_DEPTH   = int(os.environ.get("CRAWL_MAX_DEPTH", "3"))
+CRAWL_MAX_PAGES   = int(os.environ.get("CRAWL_MAX_PAGES", "2000"))
+CRAWL_DELAY       = float(os.environ.get("CRAWL_DELAY", "0.5"))
 CRAWL_STRIP_QUERY = os.environ.get("CRAWL_STRIP_QUERY", "true").lower() == "true"
+CRAWL_MAX_WORKERS = int(os.environ.get("CRAWL_MAX_WORKERS", "20"))
 
 # Set to "false" to disable robots.txt checking entirely (useful for sites
 # that redirect the robots.txt fetch to a login page, blocking all crawling).
@@ -70,8 +77,8 @@ CRAWL_EXCLUDE_ENV = [
 ]
 
 REQUEST_TIMEOUT = 30
-MAX_RETRIES = 2
-RETRY_BACKOFF = 2
+MAX_RETRIES     = 2
+RETRY_BACKOFF   = 2
 
 USER_AGENT = "OSU-RAG-Bot/1.0 (+oregonstate.edu)"
 
@@ -83,6 +90,11 @@ SKIP_EXTENSIONS: set[str] = {
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".xml", ".rss", ".atom", ".json", ".csv",
 }
+
+# Boilerplate tags to strip before text extraction
+BOILERPLATE_TAGS: tuple[str, ...] = (
+    "nav", "footer", "header", "script", "style", "noscript", "aside"
+)
 
 # ──────────────────────────────────────────────
 # Logging
@@ -115,24 +127,23 @@ def normalize_url(url: str) -> str:
 
     scheme = parsed.scheme.lower()
     netloc = parsed.netloc.lower()
-    path = parsed.path.rstrip("/") or "/"
-    query = "" if CRAWL_STRIP_QUERY else parsed.query
+    path   = parsed.path.rstrip("/") or "/"
+    query  = "" if CRAWL_STRIP_QUERY else parsed.query
 
     return urlunparse((scheme, netloc, path, parsed.params, query, ""))
 
 
 def should_skip_url(url: str) -> bool:
     """Check if a URL points to a non-HTML resource by extension."""
-    parsed = urlparse(url)
+    parsed     = urlparse(url)
     path_lower = parsed.path.lower()
     return any(path_lower.endswith(ext) for ext in SKIP_EXTENSIONS)
 
 
 # Regex for low-quality URL segments: pure numeric IDs, UUIDs, hex hashes
-_NUMERIC_SLUG  = re.compile(r"/(\d{4,})(?:/|$)")
-_UUID_SLUG     = re.compile(r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:/|$)", re.I)
-_HEX_SLUG      = re.compile(r"/[0-9a-f]{24,}(?:/|$)", re.I)
-# Very deep paths (>= 8 segments) at crawl depth >1 are usually auto-generated
+_NUMERIC_SLUG = re.compile(r"/(\d{4,})(?:/|$)")
+_UUID_SLUG    = re.compile(r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:/|$)", re.I)
+_HEX_SLUG     = re.compile(r"/[0-9a-f]{24,}(?:/|$)", re.I)
 _MAX_PATH_SEGS = 8
 
 
@@ -142,7 +153,7 @@ def is_low_quality_url(url: str) -> str | None:
     low-quality (should be skipped), or None if it looks fine.
     """
     parsed = urlparse(url)
-    path = parsed.path
+    path   = parsed.path
 
     if _NUMERIC_SLUG.search(path):
         return "numeric-slug"
@@ -177,7 +188,7 @@ def load_exclusions(path: Path = EXCLUSIONS_FILE) -> list[str]:
     anywhere in a URL, causes that URL to be skipped.
     Patterns from CRAWL_EXCLUDE_PATTERNS env var are merged in.
     """
-    patterns: list[str] = list(CRAWL_EXCLUDE_ENV)  # start with env overrides
+    patterns: list[str] = list(CRAWL_EXCLUDE_ENV)
     if path.exists():
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -201,10 +212,11 @@ def is_excluded_url(url: str) -> bool:
 # Robots.txt
 # ══════════════════════════════════════════════
 class RobotsChecker:
-    """Caches robots.txt parsers per domain."""
+    """Caches robots.txt parsers per domain. Thread-safe."""
 
     def __init__(self) -> None:
         self._cache: dict[str, RobotFileParser] = {}
+        self._lock  = threading.Lock()
 
     def can_fetch(self, url: str) -> bool:
         # Global bypass
@@ -219,29 +231,64 @@ class RobotsChecker:
         if domain in CRAWL_ROBOTS_IGNORE_DOMAINS:
             return True
 
-        if origin not in self._cache:
-            rp = RobotFileParser()
-            robots_url = f"{origin}/robots.txt"
-            try:
-                rp.set_url(robots_url)
-                rp.read()
-                # Sanity-check: if the parser blocks everything including the root,
-                # the robots.txt was likely a login redirect page — treat as allow-all.
-                if not rp.can_fetch("*", origin + "/"):
-                    log.debug(
-                        "robots.txt for %s blocks root — likely a login redirect, allowing",
-                        origin,
-                    )
+        with self._lock:
+            if origin not in self._cache:
+                rp = RobotFileParser()
+                robots_url = f"{origin}/robots.txt"
+                try:
+                    rp.set_url(robots_url)
+                    rp.read()
+                    # Sanity-check: if the parser blocks everything including the root,
+                    # the robots.txt was likely a login redirect page — treat as allow-all.
+                    if not rp.can_fetch("*", origin + "/"):
+                        log.debug(
+                            "robots.txt for %s blocks root — likely a login redirect, allowing",
+                            origin,
+                        )
+                        rp = RobotFileParser()
+                        rp.allow_all = True
+                except Exception:
+                    log.debug("Could not fetch robots.txt for %s -- allowing", origin)
                     rp = RobotFileParser()
                     rp.allow_all = True
-            except Exception:
-                # If robots.txt is unreachable, allow crawling
-                log.debug("Could not fetch robots.txt for %s -- allowing", origin)
-                rp = RobotFileParser()
-                rp.allow_all = True
-            self._cache[origin] = rp
+                self._cache[origin] = rp
 
-        return self._cache[origin].can_fetch(USER_AGENT, url)
+            return self._cache[origin].can_fetch(USER_AGENT, url)
+
+
+# ══════════════════════════════════════════════
+# Domain-level Rate Limiter
+# ══════════════════════════════════════════════
+class DomainRateLimiter:
+    """
+    Enforces a minimum delay between fetches to the same domain.
+    Thread-safe: multiple workers share one instance.
+    """
+
+    def __init__(self, delay_s: float = CRAWL_DELAY) -> None:
+        self._delay   = delay_s
+        self._last:   dict[str, float] = {}
+        self._locks:  dict[str, threading.Lock] = {}
+        self._global  = threading.Lock()
+
+    def _domain_lock(self, domain: str) -> threading.Lock:
+        with self._global:
+            if domain not in self._locks:
+                self._locks[domain] = threading.Lock()
+            return self._locks[domain]
+
+    def wait(self, url: str) -> None:
+        """Block until it is polite to fetch `url`."""
+        if self._delay <= 0:
+            return
+        domain = urlparse(url).hostname or url
+        lock   = self._domain_lock(domain)
+        with lock:
+            now     = time.monotonic()
+            elapsed = now - self._last.get(domain, 0.0)
+            if elapsed < self._delay:
+                time.sleep(self._delay - elapsed)
+            self._last[domain] = time.monotonic()
 
 
 # ══════════════════════════════════════════════
@@ -251,6 +298,8 @@ class RobotsChecker:
 class FetchResult:
     """All metadata returned from a single page fetch."""
     html:         str | None = None
+    text:         str | None = None   # cleaned body text (cached for ETL reuse)
+    title:        str        = ""
     status_code:  int | None = None
     final_url:    str        = ""
     content_type: str        = ""
@@ -259,9 +308,23 @@ class FetchResult:
     error:        str | None = None
 
 
-def fetch_page(url: str) -> FetchResult:
-    """Fetch a page with retries. Returns a FetchResult."""
+def _extract_text_and_title(html: str) -> tuple[str, str]:
+    """Strip boilerplate tags, return (title, cleaned_body_text)."""
+    soup = BeautifulSoup(html, "lxml")
+    title_tag = soup.find("title")
+    title = title_tag.get_text(strip=True) if title_tag else ""
+    for tag in BOILERPLATE_TAGS:
+        for t in soup.find_all(tag):
+            t.decompose()
+    text = soup.get_text(separator=" ")
+    return title, text
+
+
+def fetch_page(url: str, rate_limiter: DomainRateLimiter | None = None) -> FetchResult:
+    """Fetch a page with retries. Respects domain rate limiter if provided."""
     for attempt in range(1, MAX_RETRIES + 1):
+        if rate_limiter:
+            rate_limiter.wait(url)
         t0 = time.monotonic()
         try:
             resp = requests.get(
@@ -270,10 +333,10 @@ def fetch_page(url: str) -> FetchResult:
                 headers={"User-Agent": USER_AGENT},
                 allow_redirects=True,
             )
-            latency_ms = int((time.monotonic() - t0) * 1000)
+            latency_ms   = int((time.monotonic() - t0) * 1000)
             content_type = resp.headers.get("Content-Type", "")
-            final_url = resp.url
-            redirected = final_url.rstrip("/") != url.rstrip("/")
+            final_url    = resp.url
+            redirected   = final_url.rstrip("/") != url.rstrip("/")
 
             if resp.status_code >= 400:
                 return FetchResult(
@@ -285,7 +348,6 @@ def fetch_page(url: str) -> FetchResult:
                     error=f"HTTP {resp.status_code}",
                 )
 
-            # Only process HTML responses
             if "text/html" not in content_type:
                 log.debug("Skipping non-HTML: %s (%s)", url, content_type)
                 return FetchResult(
@@ -297,8 +359,13 @@ def fetch_page(url: str) -> FetchResult:
                     error="non-html",
                 )
 
+            # Extract cleaned text + title eagerly so ETL can skip re-fetching
+            title, text = _extract_text_and_title(resp.text)
+
             return FetchResult(
                 html=resp.text,
+                text=text,
+                title=title,
                 status_code=resp.status_code,
                 final_url=final_url,
                 content_type=content_type,
@@ -322,21 +389,18 @@ def fetch_page(url: str) -> FetchResult:
 # ══════════════════════════════════════════════
 def extract_links(html: str, base_url: str) -> list[str]:
     """Extract and resolve all <a href> links from HTML."""
-    soup = BeautifulSoup(html, "lxml")
+    soup  = BeautifulSoup(html, "lxml")
     links: list[str] = []
 
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
 
-        # Skip javascript:, mailto:, tel:, etc.
         if re.match(r"^(javascript|mailto|tel|data|ftp):", href, re.IGNORECASE):
             continue
 
-        # Resolve relative URLs
-        absolute = urljoin(base_url, href)
+        absolute   = urljoin(base_url, href)
         normalized = normalize_url(absolute)
 
-        # Only keep oregonstate.edu URLs
         if is_oregonstate_url(normalized) and not should_skip_url(normalized):
             links.append(normalized)
 
@@ -344,13 +408,27 @@ def extract_links(html: str, base_url: str) -> list[str]:
 
 
 # ══════════════════════════════════════════════
-# BFS Crawler
+# Parallel BFS Crawler
 # ══════════════════════════════════════════════
+
+@dataclass
+class _WorkItem:
+    url:      str
+    depth:    int
+    referrer: str
+
+
 def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
     """
-    BFS crawl starting from seed URLs.
+    Parallel BFS crawl starting from seed URLs.
 
-    Returns a dict of {url: {depth, discovered_at}} for all discovered URLs.
+    Uses a ThreadPoolExecutor (CRAWL_MAX_WORKERS workers) so multiple
+    pages are fetched concurrently while per-domain rate limiting keeps
+    the crawl polite.
+
+    Returns a dict of {url: metadata} for all successfully crawled URLs.
+    The metadata includes 'text' and 'title' so the ETL pipeline can skip
+    re-fetching pages that were already fetched during crawling.
     """
     if seed_urls is None:
         seed_urls = load_seed_urls()
@@ -360,19 +438,29 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
         return {}
 
     log.info("=" * 60)
-    log.info("OSU Web Crawler -- starting BFS crawl")
-    log.info("  Seeds: %d | Max depth: %d | Max pages: %d | Delay: %.1fs",
-             len(seed_urls), CRAWL_MAX_DEPTH, CRAWL_MAX_PAGES, CRAWL_DELAY)
+    log.info("OSU Web Crawler -- starting parallel BFS crawl")
+    log.info(
+        "  Seeds: %d | Max depth: %d | Max pages: %d | Workers: %d | Delay/domain: %.2fs",
+        len(seed_urls), CRAWL_MAX_DEPTH, CRAWL_MAX_PAGES, CRAWL_MAX_WORKERS, CRAWL_DELAY,
+    )
     if _EXCLUSIONS:
         log.info("  Exclusion patterns: %d (see url_exclusions.txt)", len(_EXCLUSIONS))
     log.info("=" * 60)
 
-    robots = RobotsChecker()
-    visited: set[str] = set()
-    discovered: dict[str, Any] = {}
-    failed: dict[str, Any] = {}
-    skipped_robots: list[str] = []
-    queue: deque[tuple[str, int, str]] = deque()  # (url, depth, referrer)
+    robots        = RobotsChecker()
+    rate_limiter  = DomainRateLimiter(delay_s=CRAWL_DELAY)
+
+    # Shared mutable state — all guarded by _state_lock
+    _state_lock   = threading.Lock()
+    visited:       set[str]          = set()
+    pending_queue: deque[_WorkItem]  = deque()
+    discovered:    dict[str, Any]    = {}
+    failed:        dict[str, Any]    = {}
+    skipped_robots: list[str]        = []
+    domain_counts: dict[str, int]    = {}
+
+    pages_crawled = 0
+    in_flight     = 0  # futures currently running
 
     crawl_started_at = datetime.now(timezone.utc).isoformat()
 
@@ -380,142 +468,169 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
     for url in seed_urls:
         norm = normalize_url(url)
         if norm not in visited:
-            queue.append((norm, 0, "[seed]"))
+            pending_queue.append(_WorkItem(url=norm, depth=0, referrer="[seed]"))
             visited.add(norm)
 
-    pages_crawled = 0
-    current_domain: str = ""
-    domain_counts: dict[str, int] = {}
+    def _process_one(item: _WorkItem) -> tuple[_WorkItem, FetchResult]:
+        """Worker: fetch one URL and return its result. Run in thread pool."""
+        return item, fetch_page(item.url, rate_limiter=rate_limiter)
 
-    while queue and pages_crawled < CRAWL_MAX_PAGES:
-        url, depth, referrer = queue.popleft()
+    with ThreadPoolExecutor(max_workers=CRAWL_MAX_WORKERS) as executor:
+        active_futures: dict[Future, _WorkItem] = {}
 
-        # ── Domain-transition banner ──────────────────────────────
-        domain = urlparse(url).hostname or ""
-        if domain != current_domain:
-            log.info("")
-            log.info("── ▶  %s  (queue=%d, crawled=%d)",
-                     domain, len(queue), pages_crawled)
-            log.info("─" * 60)
-            current_domain = domain
+        def _submit_pending() -> None:
+            """Submit as many queued items as we have worker budget for."""
+            nonlocal pages_crawled
+            while pending_queue:
+                with _state_lock:
+                    if pages_crawled + len(active_futures) >= CRAWL_MAX_PAGES:
+                        break
+                item = pending_queue.popleft()
 
-        # Check robots.txt
-        if not robots.can_fetch(url):
-            log.debug("  [robots] Blocked: %s", url)
-            skipped_robots.append(url)
-            continue
+                # Robots check (fast, cached after first domain hit)
+                if not robots.can_fetch(item.url):
+                    log.debug("  [robots] Blocked: %s", item.url)
+                    with _state_lock:
+                        skipped_robots.append(item.url)
+                    continue
 
-        # Fetch
-        result = fetch_page(url)
+                fut = executor.submit(_process_one, item)
+                active_futures[fut] = item
 
-        now_utc = datetime.now(timezone.utc).isoformat()
+        _submit_pending()
 
-        # Error / non-HTML → record in failed list, don’t count as crawled
-        if result.html is None:
-            # Only warn for real errors (4xx/5xx/network), not non-html skips
-            is_dead = result.error not in (None, "non-html")
-            if is_dead:
-                log.warning("  [DEAD] %s -- %s", result.error, url)
-                log.warning("         Linked from: %s", referrer)
-            else:
-                log.debug("  [skip] %s -- %s", result.error, url)
-            failed[url] = {
-                "depth":        depth,
-                "domain":       domain,
-                "status_code":  result.status_code,
-                "final_url":    result.final_url,
-                "content_type": result.content_type,
-                "latency_ms":   result.latency_ms,
-                "redirected":   result.redirected,
-                "error":        result.error,
-                "referrer":     referrer,
-                "attempted_at": now_utc,
-            }
-            continue
+        while active_futures:
+            # Wait for any one future to complete
+            done_futures = []
+            for fut in list(active_futures.keys()):
+                if fut.done():
+                    done_futures.append(fut)
+            if not done_futures:
+                time.sleep(0.05)
+                continue
 
-        pages_crawled += 1
-        domain_counts[domain] = domain_counts.get(domain, 0) + 1
+            for fut in done_futures:
+                item   = active_futures.pop(fut)
+                result: FetchResult
+                try:
+                    _, result = fut.result()
+                except Exception as exc:
+                    log.warning("Unexpected error fetching %s: %s", item.url, exc)
+                    result = FetchResult(error=str(exc))
 
-        # ── Extract cleaned text to count words ──────────────────────
-        soup_body = BeautifulSoup(result.html, "lxml")
-        for tag in ("nav", "footer", "header", "script", "style", "noscript", "aside"):
-            for t in soup_body.find_all(tag):
-                t.decompose()
-        page_title = (soup_body.find("title") or type("_", (), {"get_text": lambda *_, **__: ""})()).get_text(strip=True)
-        page_text  = soup_body.get_text(separator=" ")
-        word_count = len(page_text.split())
-        is_thin    = word_count < MIN_TEXT_WORDS
+                now_utc = datetime.now(timezone.utc).isoformat()
+                domain  = urlparse(item.url).hostname or ""
 
-        if is_thin:
-            log.debug("  [thin] %d words, skipping child links: %s", word_count, url)
+                # ── Error / non-HTML ────────────────────────────────────────
+                if result.html is None:
+                    is_dead = result.error not in (None, "non-html")
+                    if is_dead:
+                        log.warning("  [DEAD] %s -- %s", result.error, item.url)
+                        log.warning("         Linked from: %s", item.referrer)
+                    else:
+                        log.debug("  [skip] %s -- %s", result.error, item.url)
+                    with _state_lock:
+                        failed[item.url] = {
+                            "depth":        item.depth,
+                            "domain":       domain,
+                            "status_code":  result.status_code,
+                            "final_url":    result.final_url,
+                            "content_type": result.content_type,
+                            "latency_ms":   result.latency_ms,
+                            "redirected":   result.redirected,
+                            "error":        result.error,
+                            "referrer":     item.referrer,
+                            "attempted_at": now_utc,
+                        }
+                    continue
 
-        # ── Extract and enqueue links (only from substantial pages) ──────
-        new_links = 0
-        new_cross_domain = 0
-        links_found = 0
-        if depth < CRAWL_MAX_DEPTH and not is_thin:
-            links = extract_links(result.html, url)
-            links_found = len(links)
-            for link in links:
-                if link not in visited:
-                    lq_reason = is_low_quality_url(link)
-                    if lq_reason:
-                        log.debug("  [lq-url] %s -- %s", lq_reason, link)
-                        visited.add(link)
-                        continue
-                    if is_excluded_url(link):
-                        log.debug("  [excluded] %s", link)
-                        visited.add(link)  # mark visited so we don't re-check it
-                        continue
-                    visited.add(link)
-                    queue.append((link, depth + 1, url))  # url is the referrer
-                    new_links += 1
-                    link_domain = urlparse(link).hostname or ""
-                    if link_domain != domain:
-                        new_cross_domain += 1
-            if new_links:
-                log.debug("    +%d new link(s) queued (%d cross-domain)", new_links, new_cross_domain)
+                # ── Successful HTML page ────────────────────────────────────
+                text  = result.text or ""
+                title = result.title or ""
+                word_count = len(text.split())
+                is_thin    = word_count < MIN_TEXT_WORDS
 
-        discovered[url] = {
-            "depth":             depth,
-            "domain":            domain,
-            "status_code":       result.status_code,
-            "final_url":         result.final_url,
-            "content_type":      result.content_type,
-            "latency_ms":        result.latency_ms,
-            "redirected":        result.redirected,
-            "word_count":        word_count,
-            "thin":              is_thin,
-            "title":             page_title,
-            "links_found":       links_found,
-            "new_links":         new_links,
-            "new_cross_domain":  new_cross_domain,
-            "crawled_at":        now_utc,
-        }
+                with _state_lock:
+                    pages_crawled += 1
+                    domain_counts[domain] = domain_counts.get(domain, 0) + 1
+                    pc = pages_crawled
 
-        cross_note = f"  ({new_cross_domain} cross-domain)" if new_cross_domain else ""
-        if pages_crawled % 25 == 0 or pages_crawled <= 5:
-            log.info("  [%d/%d] d=%d  %dms  +%d links%s  %s",
-                     pages_crawled, CRAWL_MAX_PAGES, depth,
-                     result.latency_ms, new_links, cross_note, url)
+                if is_thin:
+                    log.debug("  [thin] %d words, skipping child links: %s", word_count, item.url)
 
-        # Politeness delay
-        time.sleep(CRAWL_DELAY)
+                # ── Enqueue child links ─────────────────────────────────────
+                new_links        = 0
+                new_cross_domain = 0
+                links_found      = 0
+
+                if item.depth < CRAWL_MAX_DEPTH and not is_thin:
+                    links       = extract_links(result.html, item.url)
+                    links_found = len(links)
+                    with _state_lock:
+                        for link in links:
+                            if link not in visited:
+                                lq = is_low_quality_url(link)
+                                if lq:
+                                    log.debug("  [lq-url] %s -- %s", lq, link)
+                                    visited.add(link)
+                                    continue
+                                if is_excluded_url(link):
+                                    log.debug("  [excluded] %s", link)
+                                    visited.add(link)
+                                    continue
+                                visited.add(link)
+                                pending_queue.append(_WorkItem(url=link, depth=item.depth + 1, referrer=item.url))
+                                new_links += 1
+                                link_domain = urlparse(link).hostname or ""
+                                if link_domain != domain:
+                                    new_cross_domain += 1
+
+                with _state_lock:
+                    discovered[item.url] = {
+                        "depth":            item.depth,
+                        "domain":           domain,
+                        "status_code":      result.status_code,
+                        "final_url":        result.final_url,
+                        "content_type":     result.content_type,
+                        "latency_ms":       result.latency_ms,
+                        "redirected":       result.redirected,
+                        "word_count":       word_count,
+                        "thin":             is_thin,
+                        "title":            title,
+                        # ── Cached content for ETL (avoids re-fetch) ──────
+                        "text":             text,
+                        # ──────────────────────────────────────────────────
+                        "links_found":      links_found,
+                        "new_links":        new_links,
+                        "new_cross_domain": new_cross_domain,
+                        "crawled_at":       now_utc,
+                    }
+
+                cross_note = f"  ({new_cross_domain} cross-domain)" if new_cross_domain else ""
+                if pc % 25 == 0 or pc <= 5:
+                    log.info(
+                        "  [%d/%d] d=%d  %dms  +%d links%s  %s",
+                        pc, CRAWL_MAX_PAGES, item.depth,
+                        result.latency_ms, new_links, cross_note, item.url,
+                    )
+
+                # Submit more work now that we have capacity
+                _submit_pending()
 
     crawl_ended_at = datetime.now(timezone.utc).isoformat()
 
-    # ── Build domain summary for JSON ────────────────────────────
+    # ── Build domain summary ─────────────────────────────────────────────────
     domain_summary: dict[str, Any] = {}
     for url_entry, meta in discovered.items():
         d = meta["domain"]
         if d not in domain_summary:
             domain_summary[d] = {
-                "pages": 0,
-                "avg_latency_ms": 0,
+                "pages":            0,
+                "avg_latency_ms":   0,
                 "total_latency_ms": 0,
                 "redirected_count": 0,
             }
-        domain_summary[d]["pages"] += 1
+        domain_summary[d]["pages"]            += 1
         domain_summary[d]["total_latency_ms"] += meta["latency_ms"]
         if meta["redirected"]:
             domain_summary[d]["redirected_count"] += 1
@@ -523,30 +638,31 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
         ds["avg_latency_ms"] = round(ds["total_latency_ms"] / ds["pages"], 1)
         del ds["total_latency_ms"]
 
-    # ── Save results ────────────────────────────────────────
+    # ── Save results ─────────────────────────────────────────────────────────
     output = {
         "crawl_metadata": {
-            "started_at":      crawl_started_at,
-            "ended_at":        crawl_ended_at,
-            "seed_urls":       seed_urls,
+            "started_at": crawl_started_at,
+            "ended_at":   crawl_ended_at,
+            "seed_urls":  seed_urls,
             "config": {
-                "max_depth":       CRAWL_MAX_DEPTH,
-                "max_pages":       CRAWL_MAX_PAGES,
-                "crawl_delay_s":   CRAWL_DELAY,
-                "strip_query":     CRAWL_STRIP_QUERY,
+                "max_depth":     CRAWL_MAX_DEPTH,
+                "max_pages":     CRAWL_MAX_PAGES,
+                "crawl_delay_s": CRAWL_DELAY,
+                "strip_query":   CRAWL_STRIP_QUERY,
+                "max_workers":   CRAWL_MAX_WORKERS,
             },
             "summary": {
-                "pages_crawled":   pages_crawled,
-                "pages_failed":    len(failed),
+                "pages_crawled":        pages_crawled,
+                "pages_failed":         len(failed),
                 "pages_skipped_robots": len(skipped_robots),
-                "urls_discovered": len(visited),
+                "urls_discovered":      len(visited),
             },
             "pages_by_domain": domain_counts,
         },
-        "domain_summary":   domain_summary,
-        "urls":             discovered,
-        "failed":           failed,
-        "skipped_robots":   skipped_robots,
+        "domain_summary":  domain_summary,
+        "urls":            discovered,
+        "failed":          failed,
+        "skipped_robots":  skipped_robots,
     }
 
     with open(DISCOVERED_URLS_FILE, "w", encoding="utf-8") as f:
@@ -554,13 +670,15 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
 
     log.info("")
     log.info("=" * 60)
-    log.info("Crawl complete -- %d pages crawled, %d failed, %d robot-blocked",
-             pages_crawled, len(failed), len(skipped_robots))
+    log.info(
+        "Crawl complete -- %d pages crawled, %d failed, %d robot-blocked",
+        pages_crawled, len(failed), len(skipped_robots),
+    )
     log.info("Pages by domain:")
     for d, count in sorted(domain_counts.items(), key=lambda x: -x[1]):
         info = domain_summary[d]
         log.info("  %-45s  %4d page(s)  avg %dms", d, count, info["avg_latency_ms"])
-    log.info("Results saved to %s", DISCOVERED_URLS_FILE)
+    log.info("Results saved to %s (includes cached text for ETL reuse)", DISCOVERED_URLS_FILE)
     log.info("=" * 60)
 
     return discovered
