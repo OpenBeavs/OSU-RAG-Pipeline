@@ -19,5 +19,6 @@ ENV PYTHONPATH="/app"
 
 EXPOSE 8080
 
-# Start the ADK API server (serves /run, /run_sse, and /.well-known/agent-card.json)
-CMD ["adk", "api_server", "--port=8080", "--host=0.0.0.0", "/app"]
+# Start the ADK API server with A2A protocol enabled
+# --a2a activates /.well-known/agent-card.json and the A2A task endpoints
+CMD ["adk", "api_server", "--port=8080", "--host=0.0.0.0", "--a2a", "/app"]

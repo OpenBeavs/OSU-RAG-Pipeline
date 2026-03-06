@@ -20,7 +20,7 @@ on:
       crawl_max_depth:
         description: "Max crawl depth (default: 3)"
         required: false
-        default: "3"
+        default: "5"
       crawl_max_workers:
         description: "Parallel crawl workers (default: 20)"
         required: false
@@ -62,7 +62,7 @@ jobs:
           # Tuned defaults: depth 3 covers all meaningful OSU content without
           # the exponential blowup of depth 6. 2000 pages is a comprehensive
           # starting point; increase via workflow_dispatch input if needed.
-          CRAWL_MAX_DEPTH:    ${{ github.event.inputs.crawl_max_depth   || '3' }}
+          CRAWL_MAX_DEPTH:    ${{ github.event.inputs.crawl_max_depth   || '5' }}
           CRAWL_MAX_PAGES:    ${{ github.event.inputs.crawl_max_pages   || '20000' }}
           CRAWL_MAX_WORKERS:  ${{ github.event.inputs.crawl_max_workers || '20' }}
           CRAWL_DELAY:        "0.2"
