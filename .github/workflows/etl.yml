@@ -16,7 +16,7 @@ on:
       crawl_max_pages:
         description: "Max pages to crawl (default: 2000)"
         required: false
-        default: "2000"
+        default: "20000"
       crawl_max_depth:
         description: "Max crawl depth (default: 3)"
         required: false
@@ -24,11 +24,11 @@ on:
       crawl_max_workers:
         description: "Parallel crawl workers (default: 20)"
         required: false
-        default: "20"
+        default: "40"
       etl_max_workers:
         description: "Parallel ETL workers (default: 10)"
         required: false
-        default: "10"
+        default: "20"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 1: Crawl
@@ -65,7 +65,7 @@ jobs:
           CRAWL_MAX_DEPTH:    ${{ github.event.inputs.crawl_max_depth   || '3' }}
           CRAWL_MAX_PAGES:    ${{ github.event.inputs.crawl_max_pages   || '2000' }}
           CRAWL_MAX_WORKERS:  ${{ github.event.inputs.crawl_max_workers || '20' }}
-          CRAWL_DELAY:        "0.25"
+          CRAWL_DELAY:        "0.5"
           CRAWL_STRIP_QUERY:  "true"
           CRAWL_MIN_WORDS:    "80"
           BASE_URL_TO_SCRAPE: "oregonstate.edu"
