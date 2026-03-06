@@ -2,7 +2,7 @@
   "name": "osu_rag_agent",
   "description": "An Oregon State University expert agent that answers questions using a RAG knowledge base of oregonstate.edu content.",
   "version": "1.0.0",
-  "url": "https://osu-rag-agent-ahkgdqjvhq-uw.a.run.app",
+  "url": "https://osu-rag-agent-716080272371.us-west1.run.app/a2a/osu_rag_agent",
   "defaultInputModes": [
     "text"
   ],

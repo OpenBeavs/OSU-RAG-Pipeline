@@ -6,19 +6,21 @@ RUN adduser --disabled-password --gecos "" appuser
 USER appuser
 ENV PATH="/home/appuser/.local/bin:$PATH"
 
-# Install dependencies
+# Install dependencies first (layer cache friendly)
 COPY --chown=appuser:appuser requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy agent source
-COPY --chown=appuser:appuser . /app/osu_rag_agent/
+# ADK api_server expects agents under /app/agents/<agent_name>/
+# Copy this folder's contents into the correct nested path
+COPY --chown=appuser:appuser . /app/agents/osu_rag_agent/
 
-# The ADK api_server expects the agent package to be importable.
-# Expose the parent directory so `import osu_rag_agent` works.
+# Parent of the agents/ directory must be on PYTHONPATH so
+# `import osu_rag_agent` resolves correctly inside the server
 ENV PYTHONPATH="/app"
 
 EXPOSE 8080
 
-# Start the ADK API server with A2A protocol enabled
-# --a2a activates /.well-known/agent-card.json and the A2A task endpoints
-CMD ["adk", "api_server", "--port=8080", "--host=0.0.0.0", "--a2a", "/app"]
+# --a2a enables the A2A protocol routes:
+#   /.well-known/agent-card.json  (top-level, served per agent)
+#   /a2a/<agent_name>/            (RPC endpoint)
+CMD ["adk", "api_server", "--port=8080", "--host=0.0.0.0", "--a2a", "/app/agents"]
