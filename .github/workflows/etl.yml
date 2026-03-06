@@ -40,6 +40,8 @@ jobs:
   crawl:
     name: "🕷️ Crawl OSU Pages"
     runs-on: ubuntu-latest
+    outputs:
+      artifact_time: ${{ steps.set_time.outputs.timestamp }}
 
     steps:
       # ── 1. Checkout ────────────────────────────────────────────────────────
@@ -72,13 +74,18 @@ jobs:
           CRAWL_EXCLUDE_PATTERNS: ""
         run: python crawler.py
 
+      # ── 3.5. Set timestamp ─────────────────────────────────────────────────
+      - name: Set timestamp
+        id: set_time
+        run: echo "timestamp=$(date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_OUTPUT
+
       # ── 4. Upload crawl output ─────────────────────────────────────────────
       # discovered_urls.json contains per-page metadata AND cached text/title
       # so the embed job can skip re-fetching every page.
       - name: Upload crawl output
         uses: actions/upload-artifact@v4
         with:
-          name: crawl-output-${{ github.run_number }}
+          name: crawl-output-${{ github.run_number }}-${{ steps.set_time.outputs.timestamp }}
           path: discovered_urls.json
           retention-days: 7
 
@@ -154,7 +161,7 @@ jobs:
       - name: Download crawl output
         uses: actions/download-artifact@v4
         with:
-          name: crawl-output-${{ github.run_number }}
+          name: crawl-output-${{ github.run_number }}-${{ needs.crawl.outputs.artifact_time }}
 
       # ── 5. Run ETL pipeline ────────────────────────────────────────────────
       - name: Run parallel ETL pipeline
@@ -166,12 +173,18 @@ jobs:
         # Reads discovered_urls.json (with cached text) — no re-crawling needed
         run: python etl_pipeline.py
 
+      # ── 5.5 Set timestamp ──────────────────────────────────────────────────
+      - name: Set timestamp
+        id: set_time
+        if: always()
+        run: echo "timestamp=$(date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_OUTPUT
+
       # ── 6. Upload dedup state ──────────────────────────────────────────────
       - name: Upload dedup state & crawl report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: etl-report-${{ github.run_number }}
+          name: etl-report-${{ github.run_number }}-${{ steps.set_time.outputs.timestamp }}
           path: |
             url_hashes.json
             discovered_urls.json
