@@ -1,0 +1,14 @@
+# OSU RAG Query Agent — Dependencies
+# Requires Python 3.10+
+
+# Google ADK with A2A protocol support
+google-adk[a2a]>=1.0.0
+
+# Google GenAI SDK (embeddings)
+google-genai>=1.5.0
+
+# Vector Database (Firestore with vector search)
+google-cloud-firestore>=2.19.0
+
+# Environment
+python-dotenv>=1.0.1
