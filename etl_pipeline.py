@@ -43,6 +43,7 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
 from google import genai
 from google.cloud import firestore
 from google.cloud.firestore_v1.vector import Vector
@@ -71,7 +72,7 @@ RETRY_BACKOFF       = 2             # seconds (exponential base)
 
 # How many URLs to process in parallel
 import os as _os
-ETL_MAX_WORKERS = int(_os.environ.get("ETL_MAX_WORKERS", "10"))
+ETL_MAX_WORKERS = int(_os.environ.get("ETL_MAX_WORKERS", "25"))
 
 # Tags whose entire subtree is stripped from the HTML before text extraction.
 BOILERPLATE_TAGS: list[str] = [
@@ -89,6 +90,21 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("osu-rag-etl")
+
+# ──────────────────────────────────────────────
+# Thread-local HTTP session (connection pooling)
+# ──────────────────────────────────────────────
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    if not hasattr(_thread_local, "session"):
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20)
+        sess = requests.Session()
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        _thread_local.session = sess
+    return _thread_local.session
 
 
 # ══════════════════════════════════════════════
@@ -138,7 +154,7 @@ def fetch_page(url: str) -> str | None:
     """Fetch raw HTML with retries and exponential backoff."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = requests.get(
+            resp = _get_session().get(
                 url,
                 timeout=REQUEST_TIMEOUT,
                 headers={"User-Agent": "OSU-RAG-Bot/1.0 (+oregonstate.edu)"},
@@ -146,12 +162,12 @@ def fetch_page(url: str) -> str | None:
             resp.raise_for_status()
             return resp.text
         except requests.RequestException as exc:
-            wait = RETRY_BACKOFF ** attempt
+            backoff = RETRY_BACKOFF ** attempt
             log.warning(
                 "Fetch attempt %d/%d failed for %s: %s -- retrying in %ds",
-                attempt, MAX_RETRIES, url, exc, wait,
+                attempt, MAX_RETRIES, url, exc, backoff,
             )
-            time.sleep(wait)
+            time.sleep(backoff)
     log.error("All %d fetch attempts failed for %s -- skipping.", MAX_RETRIES, url)
     return None
 

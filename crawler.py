@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait as cf_wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +35,7 @@ from urllib.robotparser import RobotFileParser
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
 
 load_dotenv()
 
@@ -46,11 +47,11 @@ URLS_FILE = ROOT_DIR / "urls.txt"
 DISCOVERED_URLS_FILE = ROOT_DIR / "discovered_urls.json"
 EXCLUSIONS_FILE = ROOT_DIR / "url_exclusions.txt"
 
-CRAWL_MAX_DEPTH   = int(os.environ.get("CRAWL_MAX_DEPTH", "3"))
-CRAWL_MAX_PAGES   = int(os.environ.get("CRAWL_MAX_PAGES", "2000"))
-CRAWL_DELAY       = float(os.environ.get("CRAWL_DELAY", "0.5"))
+CRAWL_MAX_DEPTH   = int(os.environ.get("CRAWL_MAX_DEPTH", "4"))
+CRAWL_MAX_PAGES   = int(os.environ.get("CRAWL_MAX_PAGES", "10000"))
+CRAWL_DELAY       = float(os.environ.get("CRAWL_DELAY", "0.25"))
 CRAWL_STRIP_QUERY = os.environ.get("CRAWL_STRIP_QUERY", "true").lower() == "true"
-CRAWL_MAX_WORKERS = int(os.environ.get("CRAWL_MAX_WORKERS", "20"))
+CRAWL_MAX_WORKERS = int(os.environ.get("CRAWL_MAX_WORKERS", "60"))
 
 # Set to "false" to disable robots.txt checking entirely (useful for sites
 # that redirect the robots.txt fetch to a login page, blocking all crawling).
@@ -106,6 +107,27 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("osu-crawler")
+
+# ──────────────────────────────────────────────
+# Thread-local HTTP session (connection pooling)
+# ──────────────────────────────────────────────
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    """Return a per-thread requests.Session with a persistent connection pool.
+
+    Reusing sessions avoids the overhead of a fresh TCP handshake (and TLS
+    negotiation) on every request.  With 60 workers each hitting the same
+    subdomain repeatedly, this meaningfully reduces per-request latency.
+    """
+    if not hasattr(_thread_local, "session"):
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20)
+        sess = requests.Session()
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        _thread_local.session = sess
+    return _thread_local.session
 
 
 # ══════════════════════════════════════════════
@@ -327,7 +349,7 @@ def fetch_page(url: str, rate_limiter: DomainRateLimiter | None = None) -> Fetch
             rate_limiter.wait(url)
         t0 = time.monotonic()
         try:
-            resp = requests.get(
+            resp = _get_session().get(
                 url,
                 timeout=REQUEST_TIMEOUT,
                 headers={"User-Agent": USER_AGENT},
@@ -375,10 +397,10 @@ def fetch_page(url: str, rate_limiter: DomainRateLimiter | None = None) -> Fetch
 
         except requests.RequestException as exc:
             latency_ms = int((time.monotonic() - t0) * 1000)
-            wait = RETRY_BACKOFF ** attempt
+            backoff = RETRY_BACKOFF ** attempt
             log.debug("Fetch attempt %d failed for %s: %s", attempt, url, exc)
             if attempt < MAX_RETRIES:
-                time.sleep(wait)
+                time.sleep(backoff)
             else:
                 log.warning("Failed to fetch: %s", url)
                 return FetchResult(error=str(exc), latency_ms=latency_ms)
@@ -500,16 +522,10 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
         _submit_pending()
 
         while active_futures:
-            # Wait for any one future to complete
-            done_futures = []
-            for fut in list(active_futures.keys()):
-                if fut.done():
-                    done_futures.append(fut)
-            if not done_futures:
-                time.sleep(0.05)
-                continue
+            # Block until at least one future finishes (no busy-wait / sleep loop).
+            done_set, _ = cf_wait(list(active_futures.keys()), return_when=FIRST_COMPLETED, timeout=1.0)
 
-            for fut in done_futures:
+            for fut in done_set:
                 item   = active_futures.pop(fut)
                 result: FetchResult
                 try:
