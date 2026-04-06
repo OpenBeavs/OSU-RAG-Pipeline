@@ -81,7 +81,25 @@ REQUEST_TIMEOUT = 30
 MAX_RETRIES     = 2
 RETRY_BACKOFF   = 2
 
-USER_AGENT = "OSU-RAG-Bot/1.0 (+oregonstate.edu)"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Headers that make requests look like a real browser navigation.
+# WAFs (Cloudflare, Akamai, etc.) flag requests that are missing these.
+BROWSER_HEADERS: dict[str, str] = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
 # File extensions to skip (non-HTML resources)
 SKIP_EXTENSIONS: set[str] = {
@@ -352,7 +370,7 @@ def fetch_page(url: str, rate_limiter: DomainRateLimiter | None = None) -> Fetch
             resp = _get_session().get(
                 url,
                 timeout=REQUEST_TIMEOUT,
-                headers={"User-Agent": USER_AGENT},
+                headers=BROWSER_HEADERS,
                 allow_redirects=True,
             )
             latency_ms   = int((time.monotonic() - t0) * 1000)

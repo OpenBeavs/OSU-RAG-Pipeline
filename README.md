@@ -1,6 +1,6 @@
 # 🌲 OSU RAG Pipeline
 
-A production-ready ETL pipeline that builds and maintains a **Vector Database** for an Oregon State University AI agent. It crawls `*.oregonstate.edu` pages, chunks the content, generates embeddings, and upserts them into Pinecone — with smart deduplication so only changed pages are re-processed.
+A production-ready ETL pipeline that builds and maintains a **Vector Database** for an Oregon State University AI agent. It crawls `*.oregonstate.edu` pages, chunks the content, generates embeddings, and upserts them into **Firestore** (with vector search) — with smart deduplication so only changed pages are re-processed.
 
 ---
 
@@ -114,7 +114,7 @@ Make sure your GCP project has Firestore enabled in **Native mode**. The vector 
 
 ### Dry Run (No API Calls)
 
-Test the full pipeline without hitting Pinecone or Google GenAI:
+Test the full pipeline without hitting Firestore or Google GenAI:
 
 ```bash
 # Static URL list only
@@ -199,8 +199,8 @@ OSU-RAG-Pipeline/
 4. CLEAN                Strip navbars, footers, scripts, and HTML boilerplate
 5. CHUNK                Split into ~512-token chunks (64-token overlap)
 6. EMBED                Generate 768-dim embeddings via text-embedding-004
-7. DELETE OLD VECTORS   Remove stale vectors for changed URLs (prefix-based)
-8. UPSERT               Write new vectors + metadata to Pinecone
+7. DELETE OLD VECTORS   Remove stale Firestore docs for changed URLs (url_hash field query, 499 ops/batch)
+8. UPSERT               Write new vectors + metadata to Firestore
 9. SAVE STATE           Persist content hashes for next run
 ```
 
@@ -255,7 +255,7 @@ Each chunk stored in Firestore includes:
 
 ## 🤖 RAG Query Agent (Google ADK + A2A)
 
-An AI agent that answers OSU questions by searching the Pinecone knowledge base. Built with [Google ADK](https://google.github.io/adk-docs/) and exposes an [A2A](https://a2aprotocol.org/) endpoint for inter-agent communication.
+An AI agent that answers OSU questions by searching the Firestore vector knowledge base. Built with [Google ADK](https://google.github.io/adk-docs/) and exposes an [A2A](https://a2aprotocol.org/) endpoint for inter-agent communication.
 
 ### Install Agent Dependencies
 
@@ -288,7 +288,7 @@ The Agent Card is served at `http://localhost:8000/.well-known/agent.json`. Othe
 OSU-RAG-Pipeline/
 ├── osu_rag_agent/
 │   ├── __init__.py        # Package init
-│   ├── agent.py           # ADK agent + Pinecone RAG search tool
+│   ├── agent.py           # ADK agent + Firestore RAG search tool
 │   └── agent.json         # A2A Agent Card
 ├── agent_requirements.txt # Agent dependencies
 └── ...                    # ETL pipeline files
@@ -296,10 +296,11 @@ OSU-RAG-Pipeline/
 
 ---
 
-## Storage:
+## Storage
 
-Vectors are stored here:
-https://console.cloud.google.com/firestore/databases/-default-/data/panel/osu-knowledge/015292636719%230?authuser=2&project=osu-genesis-hub
+Vectors are stored in the `osu-knowledge` Firestore collection in the `osu-genesis-hub` GCP project.
+
+GCP Console: https://console.cloud.google.com/firestore/databases/-default-/data/panel/osu-knowledge?project=osu-genesis-hub
 
 ## License
 
