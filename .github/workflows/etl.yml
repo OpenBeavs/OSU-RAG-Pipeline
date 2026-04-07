@@ -16,7 +16,7 @@ on:
       crawl_max_pages:
         description: "Max pages to crawl (default: 2000)"
         required: false
-        default: "20000"
+        default: "70000"
       crawl_max_depth:
         description: "Max crawl depth (default: 3)"
         required: false
@@ -65,7 +65,7 @@ jobs:
           # the exponential blowup of depth 6. 2000 pages is a comprehensive
           # starting point; increase via workflow_dispatch input if needed.
           CRAWL_MAX_DEPTH:    ${{ github.event.inputs.crawl_max_depth   || '5' }}
-          CRAWL_MAX_PAGES:    ${{ github.event.inputs.crawl_max_pages   || '20000' }}
+          CRAWL_MAX_PAGES:    ${{ github.event.inputs.crawl_max_pages   || '70000' }}
           CRAWL_MAX_WORKERS:  ${{ github.event.inputs.crawl_max_workers || '20' }}
           CRAWL_DELAY:        "0.2"
           CRAWL_STRIP_QUERY:  "true"
