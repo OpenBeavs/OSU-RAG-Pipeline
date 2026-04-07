@@ -3,7 +3,7 @@ name: OSU RAG ETL Pipeline
 on:
   # Refresh the knowledge base daily
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 24 * * *"
 
   # Config changes take effect immediately on push to main
   push:
@@ -64,12 +64,12 @@ jobs:
           # Tuned defaults: depth 3 covers all meaningful OSU content without
           # the exponential blowup of depth 6. 2000 pages is a comprehensive
           # starting point; increase via workflow_dispatch input if needed.
-          CRAWL_MAX_DEPTH:    ${{ github.event.inputs.crawl_max_depth   || '5' }}
-          CRAWL_MAX_PAGES:    ${{ github.event.inputs.crawl_max_pages   || '70000' }}
-          CRAWL_MAX_WORKERS:  ${{ github.event.inputs.crawl_max_workers || '20' }}
-          CRAWL_DELAY:        "0.2"
-          CRAWL_STRIP_QUERY:  "true"
-          CRAWL_MIN_WORDS:    "80"
+          CRAWL_MAX_DEPTH: ${{ github.event.inputs.crawl_max_depth   || '5' }}
+          CRAWL_MAX_PAGES: ${{ github.event.inputs.crawl_max_pages   || '70000' }}
+          CRAWL_MAX_WORKERS: ${{ github.event.inputs.crawl_max_workers || '20' }}
+          CRAWL_DELAY: "0.2"
+          CRAWL_STRIP_QUERY: "true"
+          CRAWL_MIN_WORDS: "80"
           BASE_URL_TO_SCRAPE: "oregonstate.edu"
           CRAWL_EXCLUDE_PATTERNS: ""
         run: python crawler.py
@@ -125,11 +125,11 @@ jobs:
           print("=" * 60)
           EOF
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 2: Embed & Upsert
-# Downloads the crawl output and runs the parallel ETL pipeline.  Pages whose
-# text was cached by the crawler are processed without any re-fetching.
-# ─────────────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Embed & Upsert
+  # Downloads the crawl output and runs the parallel ETL pipeline.  Pages whose
+  # text was cached by the crawler are processed without any re-fetching.
+  # ─────────────────────────────────────────────────────────────────────────────
   embed:
     name: "🧠 Embed & Upsert to Firestore"
     needs: crawl
@@ -166,10 +166,10 @@ jobs:
       # ── 5. Run ETL pipeline ────────────────────────────────────────────────
       - name: Run parallel ETL pipeline
         env:
-          GOOGLE_API_KEY:       ${{ secrets.GOOGLE_API_KEY }}
-          GCP_PROJECT_ID:       ${{ secrets.GCP_PROJECT_ID }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           FIRESTORE_COLLECTION: osu-knowledge
-          ETL_MAX_WORKERS:      ${{ github.event.inputs.etl_max_workers || '10' }}
+          ETL_MAX_WORKERS: ${{ github.event.inputs.etl_max_workers || '10' }}
         # Reads discovered_urls.json (with cached text) — no re-crawling needed
         run: python etl_pipeline.py
 

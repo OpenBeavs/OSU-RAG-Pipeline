@@ -51,7 +51,7 @@ CRAWL_MAX_DEPTH   = int(os.environ.get("CRAWL_MAX_DEPTH", "4"))
 CRAWL_MAX_PAGES   = int(os.environ.get("CRAWL_MAX_PAGES", "10000"))
 CRAWL_DELAY       = float(os.environ.get("CRAWL_DELAY", "0.25"))
 CRAWL_STRIP_QUERY = os.environ.get("CRAWL_STRIP_QUERY", "true").lower() == "true"
-CRAWL_MAX_WORKERS = int(os.environ.get("CRAWL_MAX_WORKERS", "60"))
+CRAWL_MAX_WORKERS = int(os.environ.get("CRAWL_MAX_WORKERS", "10"))
 
 # Set to "false" to disable robots.txt checking entirely (useful for sites
 # that redirect the robots.txt fetch to a login page, blocking all crawling).
@@ -360,8 +360,40 @@ def _extract_text_and_title(html: str) -> tuple[str, str]:
     return title, text
 
 
-def fetch_page(url: str, rate_limiter: DomainRateLimiter | None = None) -> FetchResult:
+def _build_headers(url: str, referrer: str | None) -> dict[str, str]:
+    """Build request headers with correct Referer and Sec-Fetch-Site for this navigation."""
+    headers = dict(BROWSER_HEADERS)
+    if not referrer or referrer == "[seed]":
+        headers["Sec-Fetch-Site"] = "none"
+        return headers
+
+    ref_host = urlparse(referrer).hostname or ""
+    req_host = urlparse(url).hostname or ""
+
+    # Determine eTLD+1 by taking last two labels (works for .edu)
+    def etld1(host: str) -> str:
+        parts = host.split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+    if ref_host == req_host:
+        fetch_site = "same-origin"
+    elif etld1(ref_host) == etld1(req_host):
+        fetch_site = "same-site"
+    else:
+        fetch_site = "cross-site"
+
+    headers["Sec-Fetch-Site"] = fetch_site
+    headers["Referer"] = referrer
+    return headers
+
+
+def fetch_page(
+    url: str,
+    rate_limiter: DomainRateLimiter | None = None,
+    referrer: str | None = None,
+) -> FetchResult:
     """Fetch a page with retries. Respects domain rate limiter if provided."""
+    headers = _build_headers(url, referrer)
     for attempt in range(1, MAX_RETRIES + 1):
         if rate_limiter:
             rate_limiter.wait(url)
@@ -370,7 +402,7 @@ def fetch_page(url: str, rate_limiter: DomainRateLimiter | None = None) -> Fetch
             resp = _get_session().get(
                 url,
                 timeout=REQUEST_TIMEOUT,
-                headers=BROWSER_HEADERS,
+                headers=headers,
                 allow_redirects=True,
             )
             latency_ms   = int((time.monotonic() - t0) * 1000)
@@ -379,6 +411,11 @@ def fetch_page(url: str, rate_limiter: DomainRateLimiter | None = None) -> Fetch
             redirected   = final_url.rstrip("/") != url.rstrip("/")
 
             if resp.status_code >= 400:
+                # Some WAFs (e.g. Akamai) return 403 with a Set-Cookie challenge
+                # and expect a retry with the cookie.  If we got cookies, retry once.
+                if resp.status_code == 403 and resp.cookies and attempt < MAX_RETRIES:
+                    log.debug("403 with cookies on %s, retrying with WAF cookie", url)
+                    continue
                 return FetchResult(
                     status_code=resp.status_code,
                     final_url=final_url,
@@ -513,7 +550,7 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
 
     def _process_one(item: _WorkItem) -> tuple[_WorkItem, FetchResult]:
         """Worker: fetch one URL and return its result. Run in thread pool."""
-        return item, fetch_page(item.url, rate_limiter=rate_limiter)
+        return item, fetch_page(item.url, rate_limiter=rate_limiter, referrer=item.referrer)
 
     with ThreadPoolExecutor(max_workers=CRAWL_MAX_WORKERS) as executor:
         active_futures: dict[Future, _WorkItem] = {}
