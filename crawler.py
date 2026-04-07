@@ -23,7 +23,7 @@ import re
 import sys
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait as cf_wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -535,6 +535,7 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
     failed:        dict[str, Any]    = {}
     skipped_robots: list[str]        = []
     domain_counts: dict[str, int]    = {}
+    domain_graph:  dict[str, set[str]] = defaultdict(set)  # from_domain → {to_domain}
 
     pages_crawled = 0
     in_flight     = 0  # futures currently running
@@ -639,6 +640,10 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
                     links_found = len(links)
                     with _state_lock:
                         for link in links:
+                            link_domain = urlparse(link).hostname or ""
+                            # Record domain-level edge for every outbound link
+                            if link_domain and link_domain != domain:
+                                domain_graph[domain].add(link_domain)
                             if link not in visited:
                                 lq = is_low_quality_url(link)
                                 if lq:
@@ -652,7 +657,6 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
                                 visited.add(link)
                                 pending_queue.append(_WorkItem(url=link, depth=item.depth + 1, referrer=item.url))
                                 new_links += 1
-                                link_domain = urlparse(link).hostname or ""
                                 if link_domain != domain:
                                     new_cross_domain += 1
 
@@ -731,6 +735,7 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
             "pages_by_domain": domain_counts,
         },
         "domain_summary":  domain_summary,
+        "domain_graph":    {k: sorted(v) for k, v in domain_graph.items()},
         "urls":            discovered,
         "failed":          failed,
         "skipped_robots":  skipped_robots,
