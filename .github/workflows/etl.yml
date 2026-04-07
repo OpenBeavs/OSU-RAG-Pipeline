@@ -24,11 +24,11 @@ on:
       crawl_max_workers:
         description: "Parallel crawl workers (default: 20)"
         required: false
-        default: "40"
+        default: "20"
       etl_max_workers:
         description: "Parallel ETL workers (default: 10)"
         required: false
-        default: "20"
+        default: "10"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 1: Crawl
