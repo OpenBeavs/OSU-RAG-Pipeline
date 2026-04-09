@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import sys
 import threading
@@ -47,11 +48,12 @@ URLS_FILE = ROOT_DIR / "urls.txt"
 DISCOVERED_URLS_FILE = ROOT_DIR / "discovered_urls.json"
 EXCLUSIONS_FILE = ROOT_DIR / "url_exclusions.txt"
 
-CRAWL_MAX_DEPTH   = int(os.environ.get("CRAWL_MAX_DEPTH", "4"))
-CRAWL_MAX_PAGES   = int(os.environ.get("CRAWL_MAX_PAGES", "10000"))
-CRAWL_DELAY       = float(os.environ.get("CRAWL_DELAY", "0.25"))
+CRAWL_MAX_DEPTH   = int(os.environ.get("CRAWL_MAX_DEPTH", "3"))
+CRAWL_MAX_PAGES   = int(os.environ.get("CRAWL_MAX_PAGES", "5000"))
+CRAWL_DELAY       = float(os.environ.get("CRAWL_DELAY", "1.0"))
+CRAWL_JITTER      = float(os.environ.get("CRAWL_JITTER", "0.5"))   # ± random seconds added to each delay
 CRAWL_STRIP_QUERY = os.environ.get("CRAWL_STRIP_QUERY", "true").lower() == "true"
-CRAWL_MAX_WORKERS = int(os.environ.get("CRAWL_MAX_WORKERS", "10"))
+CRAWL_MAX_WORKERS = int(os.environ.get("CRAWL_MAX_WORKERS", "5"))
 
 # Set to "false" to disable robots.txt checking entirely (useful for sites
 # that redirect the robots.txt fetch to a login page, blocking all crawling).
@@ -70,7 +72,7 @@ BASE_URL_TO_SCRAPE = os.environ.get("BASE_URL_TO_SCRAPE", "oregonstate.edu")
 # Pages with fewer than this many words after boilerplate removal are considered
 # "thin" — they are still recorded in JSON but their outbound links are NOT
 # enqueued, preventing stub/index pages from spawning huge BFS sub-trees.
-MIN_TEXT_WORDS = int(os.environ.get("CRAWL_MIN_WORDS", "80"))
+MIN_TEXT_WORDS = int(os.environ.get("CRAWL_MIN_WORDS", "150"))
 
 # Extra comma-separated exclusion patterns from environment (merged with exclusions file)
 CRAWL_EXCLUDE_ENV = [
@@ -305,8 +307,9 @@ class DomainRateLimiter:
     Thread-safe: multiple workers share one instance.
     """
 
-    def __init__(self, delay_s: float = CRAWL_DELAY) -> None:
+    def __init__(self, delay_s: float = CRAWL_DELAY, jitter_s: float = CRAWL_JITTER) -> None:
         self._delay   = delay_s
+        self._jitter  = jitter_s
         self._last:   dict[str, float] = {}
         self._locks:  dict[str, threading.Lock] = {}
         self._global  = threading.Lock()
@@ -318,16 +321,19 @@ class DomainRateLimiter:
             return self._locks[domain]
 
     def wait(self, url: str) -> None:
-        """Block until it is polite to fetch `url`."""
+        """Block until it is polite to fetch `url`, then add random jitter."""
         if self._delay <= 0:
             return
-        domain = urlparse(url).hostname or url
-        lock   = self._domain_lock(domain)
+        domain  = urlparse(url).hostname or url
+        lock    = self._domain_lock(domain)
         with lock:
             now     = time.monotonic()
             elapsed = now - self._last.get(domain, 0.0)
-            if elapsed < self._delay:
-                time.sleep(self._delay - elapsed)
+            wait    = self._delay - elapsed
+            if self._jitter > 0:
+                wait += random.uniform(0, self._jitter)
+            if wait > 0:
+                time.sleep(wait)
             self._last[domain] = time.monotonic()
 
 
@@ -517,8 +523,8 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
     log.info("=" * 60)
     log.info("OSU Web Crawler -- starting parallel BFS crawl")
     log.info(
-        "  Seeds: %d | Max depth: %d | Max pages: %d | Workers: %d | Delay/domain: %.2fs",
-        len(seed_urls), CRAWL_MAX_DEPTH, CRAWL_MAX_PAGES, CRAWL_MAX_WORKERS, CRAWL_DELAY,
+        "  Seeds: %d | Max depth: %d | Max pages: %d | Workers: %d | Delay: %.2fs ± %.2fs jitter",
+        len(seed_urls), CRAWL_MAX_DEPTH, CRAWL_MAX_PAGES, CRAWL_MAX_WORKERS, CRAWL_DELAY, CRAWL_JITTER,
     )
     if _EXCLUSIONS:
         log.info("  Exclusion patterns: %d (see url_exclusions.txt)", len(_EXCLUSIONS))

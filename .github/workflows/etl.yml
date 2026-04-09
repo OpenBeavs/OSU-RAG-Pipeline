@@ -3,7 +3,7 @@ name: OSU RAG ETL Pipeline
 on:
   # Refresh the knowledge base daily
   schedule:
-    - cron: "0 24 * * *"
+    - cron: "0 6 * * *"
 
   # Config changes take effect immediately on push to main
   push:
@@ -13,20 +13,32 @@ on:
   # Allow manual runs from the GitHub Actions UI
   workflow_dispatch:
     inputs:
-      crawl_max_pages:
-        description: "Max pages to crawl (default: 2000)"
-        required: false
-        default: "70000"
       crawl_max_depth:
-        description: "Max crawl depth (default: 3)"
+        description: "Max crawl depth"
+        required: false
+        default: "3"
+      crawl_max_pages:
+        description: "Max pages to crawl"
+        required: false
+        default: "5000"
+      crawl_max_workers:
+        description: "Parallel crawl workers"
         required: false
         default: "5"
-      crawl_max_workers:
-        description: "Parallel crawl workers (default: 20)"
+      crawl_delay:
+        description: "Seconds between requests per domain"
         required: false
-        default: "20"
+        default: "1.0"
+      crawl_jitter:
+        description: "Random extra seconds added to each delay (0–N)"
+        required: false
+        default: "0.5"
+      crawl_min_words:
+        description: "Minimum word count to follow a page's links"
+        required: false
+        default: "150"
       etl_max_workers:
-        description: "Parallel ETL workers (default: 10)"
+        description: "Parallel ETL workers"
         required: false
         default: "10"
 
@@ -61,25 +73,23 @@ jobs:
       # ── 3. Run crawler ─────────────────────────────────────────────────────
       - name: Run parallel BFS crawler
         env:
-          # Tuned defaults: depth 3 covers all meaningful OSU content without
-          # the exponential blowup of depth 6. 2000 pages is a comprehensive
-          # starting point; increase via workflow_dispatch input if needed.
-          CRAWL_MAX_DEPTH: ${{ github.event.inputs.crawl_max_depth   || '5' }}
-          CRAWL_MAX_PAGES: ${{ github.event.inputs.crawl_max_pages   || '70000' }}
-          CRAWL_MAX_WORKERS: ${{ github.event.inputs.crawl_max_workers || '20' }}
-          CRAWL_DELAY: "0.2"
+          CRAWL_MAX_DEPTH:   ${{ github.event.inputs.crawl_max_depth   || '3' }}
+          CRAWL_MAX_PAGES:   ${{ github.event.inputs.crawl_max_pages   || '5000' }}
+          CRAWL_MAX_WORKERS: ${{ github.event.inputs.crawl_max_workers || '5' }}
+          CRAWL_DELAY:       ${{ github.event.inputs.crawl_delay       || '1.0' }}
+          CRAWL_JITTER:      ${{ github.event.inputs.crawl_jitter      || '0.5' }}
+          CRAWL_MIN_WORDS:   ${{ github.event.inputs.crawl_min_words   || '150' }}
           CRAWL_STRIP_QUERY: "true"
-          CRAWL_MIN_WORDS: "80"
+          CRAWL_RESPECT_ROBOTS: "true"
           BASE_URL_TO_SCRAPE: "oregonstate.edu"
-          CRAWL_EXCLUDE_PATTERNS: ""
         run: python crawler.py
 
-      # ── 3.5. Set timestamp ─────────────────────────────────────────────────
+      # ── 4. Set timestamp ───────────────────────────────────────────────────
       - name: Set timestamp
         id: set_time
         run: echo "timestamp=$(date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_OUTPUT
 
-      # ── 4. Upload crawl output ─────────────────────────────────────────────
+      # ── 5. Upload crawl output ─────────────────────────────────────────────
       # discovered_urls.json contains per-page metadata AND cached text/title
       # so the embed job can skip re-fetching every page.
       - name: Upload crawl output
@@ -89,7 +99,7 @@ jobs:
           path: discovered_urls.json
           retention-days: 7
 
-      # ── 5. Quick crawl summary ─────────────────────────────────────────────
+      # ── 6. Quick crawl summary ─────────────────────────────────────────────
       - name: Print crawl summary
         if: always()
         run: |
@@ -166,20 +176,20 @@ jobs:
       # ── 5. Run ETL pipeline ────────────────────────────────────────────────
       - name: Run parallel ETL pipeline
         env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GOOGLE_API_KEY:       ${{ secrets.GOOGLE_API_KEY }}
+          GCP_PROJECT_ID:       ${{ secrets.GCP_PROJECT_ID }}
           FIRESTORE_COLLECTION: osu-knowledge
-          ETL_MAX_WORKERS: ${{ github.event.inputs.etl_max_workers || '10' }}
+          ETL_MAX_WORKERS:      ${{ github.event.inputs.etl_max_workers || '10' }}
         # Reads discovered_urls.json (with cached text) — no re-crawling needed
         run: python etl_pipeline.py
 
-      # ── 5.5 Set timestamp ──────────────────────────────────────────────────
+      # ── 6. Set timestamp ───────────────────────────────────────────────────
       - name: Set timestamp
         id: set_time
         if: always()
         run: echo "timestamp=$(date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_OUTPUT
 
-      # ── 6. Upload dedup state ──────────────────────────────────────────────
+      # ── 7. Upload dedup state ──────────────────────────────────────────────
       - name: Upload dedup state & crawl report
         if: always()
         uses: actions/upload-artifact@v4
@@ -190,7 +200,7 @@ jobs:
             discovered_urls.json
           retention-days: 30
 
-      # ── 7. ETL summary ─────────────────────────────────────────────────────
+      # ── 8. ETL summary ─────────────────────────────────────────────────────
       - name: Print ETL summary
         if: always()
         run: |

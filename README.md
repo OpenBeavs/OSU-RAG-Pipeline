@@ -11,6 +11,7 @@ A production-ready ETL pipeline that builds and maintains a **Vector Database** 
 - **Stale Vector Cleanup** — Old vectors are deleted before new ones are upserted (no ghost data)
 - **Retry + Backoff** — Handles network timeouts common with `.edu` sites
 - **Robots.txt Compliance** — Respects each subdomain's `robots.txt`
+- **Knowledge Graph Visualizer** — Interactive D3 force graph showing all crawled domains, their connections, and page-level detail
 - **Configurable** — Depth limits, page caps, and crawl delays via environment variables
 - **Cron-Ready** — Designed to run on a schedule (e.g., every 6 hours)
 
@@ -142,6 +143,29 @@ python crawler.py
 
 This outputs `discovered_urls.json` which you can inspect or edit before running the pipeline.
 
+### Visualize the Knowledge Graph
+
+After running the crawler, generate an interactive graph of all discovered domains and their connections:
+
+```bash
+python visualize.py
+```
+
+This reads `discovered_urls.json`, generates `graph.html`, and opens it in your browser. No extra dependencies — D3.js is loaded from CDN (requires internet connection).
+
+**Features:**
+- Force-directed graph with one node per subdomain, sized by page count
+- Edges show which domains link to each other
+- Click a node to see all its pages (title, word count, depth, direct links)
+- Hover for a quick stats tooltip (latency, thin page %, failed count)
+- Search bar to highlight matching domains
+- Zoom, pan, and drag to explore
+
+```bash
+python visualize.py --no-open          # generate graph.html without opening
+python visualize.py path/to/file.json  # use a custom crawl output file
+```
+
 ---
 
 ## Scheduling (Cron)
@@ -177,13 +201,16 @@ Add this line:
 OSU-RAG-Pipeline/
 ├── etl_pipeline.py        # Main ETL pipeline (fetch → dedup → chunk → embed → upsert)
 ├── crawler.py             # BFS web crawler for *.oregonstate.edu
+├── visualize.py           # Knowledge graph visualizer (generates graph.html)
 ├── urls.txt               # Seed URLs for the crawler
+├── url_exclusions.txt     # URL patterns to skip during crawl
 ├── requirements.txt       # Python dependencies
 ├── .env.example           # Environment variable template
 ├── .env                   # Your local config (gitignored)
 ├── .gitignore
 ├── url_hashes.json        # Auto-generated: content hash state (gitignored)
-└── discovered_urls.json   # Auto-generated: crawler output (gitignored)
+├── discovered_urls.json   # Auto-generated: crawler output (gitignored)
+└── graph.html             # Auto-generated: interactive knowledge graph (gitignored)
 ```
 
 ---
