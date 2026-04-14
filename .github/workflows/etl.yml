@@ -24,7 +24,7 @@ on:
       crawl_max_workers:
         description: "Parallel crawl workers"
         required: false
-        default: "5"
+        default: "3"
       crawl_delay:
         description: "Seconds between requests per domain"
         required: false
@@ -73,12 +73,12 @@ jobs:
       # ── 3. Run crawler ─────────────────────────────────────────────────────
       - name: Run parallel BFS crawler
         env:
-          CRAWL_MAX_DEPTH:   ${{ github.event.inputs.crawl_max_depth   || '3' }}
-          CRAWL_MAX_PAGES:   ${{ github.event.inputs.crawl_max_pages   || '5000' }}
+          CRAWL_MAX_DEPTH: ${{ github.event.inputs.crawl_max_depth   || '3' }}
+          CRAWL_MAX_PAGES: ${{ github.event.inputs.crawl_max_pages   || '5000' }}
           CRAWL_MAX_WORKERS: ${{ github.event.inputs.crawl_max_workers || '5' }}
-          CRAWL_DELAY:       ${{ github.event.inputs.crawl_delay       || '1.0' }}
-          CRAWL_JITTER:      ${{ github.event.inputs.crawl_jitter      || '0.5' }}
-          CRAWL_MIN_WORDS:   ${{ github.event.inputs.crawl_min_words   || '150' }}
+          CRAWL_DELAY: ${{ github.event.inputs.crawl_delay       || '1.0' }}
+          CRAWL_JITTER: ${{ github.event.inputs.crawl_jitter      || '0.5' }}
+          CRAWL_MIN_WORDS: ${{ github.event.inputs.crawl_min_words   || '150' }}
           CRAWL_STRIP_QUERY: "true"
           CRAWL_RESPECT_ROBOTS: "true"
           BASE_URL_TO_SCRAPE: "oregonstate.edu"
@@ -99,7 +99,18 @@ jobs:
           path: discovered_urls.json
           retention-days: 7
 
-      # ── 6. Quick crawl summary ─────────────────────────────────────────────
+      # ── 6. Generate knowledge graph ───────────────────────────────────────
+      - name: Generate knowledge graph
+        run: python visualize.py --no-open
+
+      - name: Upload knowledge graph
+        uses: actions/upload-artifact@v4
+        with:
+          name: knowledge-graph-${{ github.run_number }}-${{ steps.set_time.outputs.timestamp }}
+          path: graph.html
+          retention-days: 30
+
+      # ── 7. Quick crawl summary ─────────────────────────────────────────────
       - name: Print crawl summary
         if: always()
         run: |
@@ -176,10 +187,10 @@ jobs:
       # ── 5. Run ETL pipeline ────────────────────────────────────────────────
       - name: Run parallel ETL pipeline
         env:
-          GOOGLE_API_KEY:       ${{ secrets.GOOGLE_API_KEY }}
-          GCP_PROJECT_ID:       ${{ secrets.GCP_PROJECT_ID }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           FIRESTORE_COLLECTION: osu-knowledge
-          ETL_MAX_WORKERS:      ${{ github.event.inputs.etl_max_workers || '10' }}
+          ETL_MAX_WORKERS: ${{ github.event.inputs.etl_max_workers || '10' }}
         # Reads discovered_urls.json (with cached text) — no re-crawling needed
         run: python etl_pipeline.py
 

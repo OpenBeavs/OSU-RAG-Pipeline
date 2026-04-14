@@ -83,6 +83,10 @@ REQUEST_TIMEOUT = 30
 MAX_RETRIES     = 2
 RETRY_BACKOFF   = 2
 
+# After this many consecutive 4xx errors from the same domain, stop crawling it entirely.
+# The domain is added to a blocklist and all queued URLs for it are drained.
+DOMAIN_CIRCUIT_BREAKER_THRESHOLD = int(os.environ.get("CRAWL_CIRCUIT_BREAKER_THRESHOLD", "5"))
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -305,14 +309,27 @@ class DomainRateLimiter:
     """
     Enforces a minimum delay between fetches to the same domain.
     Thread-safe: multiple workers share one instance.
+
+    Adaptive backoff: penalize() doubles the delay for a domain after 4xx
+    errors (capped at max_delay_s); reset_penalty() restores the base delay
+    on the next success.  set_retry_after() freezes a domain for the number
+    of seconds specified in a Retry-After response header.
     """
 
-    def __init__(self, delay_s: float = CRAWL_DELAY, jitter_s: float = CRAWL_JITTER) -> None:
-        self._delay   = delay_s
-        self._jitter  = jitter_s
-        self._last:   dict[str, float] = {}
-        self._locks:  dict[str, threading.Lock] = {}
-        self._global  = threading.Lock()
+    def __init__(
+        self,
+        delay_s: float = CRAWL_DELAY,
+        jitter_s: float = CRAWL_JITTER,
+        max_delay_s: float = 60.0,
+    ) -> None:
+        self._base_delay    = delay_s
+        self._jitter        = jitter_s
+        self._max_delay     = max_delay_s
+        self._last:         dict[str, float] = {}
+        self._domain_delay: dict[str, float] = {}   # per-domain adaptive delay
+        self._freeze_until: dict[str, float] = {}   # absolute monotonic freeze time (Retry-After)
+        self._locks:        dict[str, threading.Lock] = {}
+        self._global        = threading.Lock()
 
     def _domain_lock(self, domain: str) -> threading.Lock:
         with self._global:
@@ -321,20 +338,58 @@ class DomainRateLimiter:
             return self._locks[domain]
 
     def wait(self, url: str) -> None:
-        """Block until it is polite to fetch `url`, then add random jitter."""
-        if self._delay <= 0:
-            return
-        domain  = urlparse(url).hostname or url
-        lock    = self._domain_lock(domain)
+        """Block until it is polite to fetch `url`, honoring rate limit and any freeze."""
+        domain = urlparse(url).hostname or url
+        lock   = self._domain_lock(domain)
         with lock:
-            now     = time.monotonic()
+            # Snapshot adaptive state under global lock (don't hold it during sleep)
+            with self._global:
+                freeze = self._freeze_until.get(domain, 0.0)
+                delay  = self._domain_delay.get(domain, self._base_delay)
+
+            now = time.monotonic()
+            if now < freeze:
+                time.sleep(freeze - now)
+                now = time.monotonic()
+
+            if delay <= 0:
+                self._last[domain] = now
+                return
             elapsed = now - self._last.get(domain, 0.0)
-            wait    = self._delay - elapsed
+            wait_s  = delay - elapsed
             if self._jitter > 0:
-                wait += random.uniform(0, self._jitter)
-            if wait > 0:
-                time.sleep(wait)
+                wait_s += random.uniform(0, self._jitter)
+            if wait_s > 0:
+                time.sleep(wait_s)
             self._last[domain] = time.monotonic()
+
+    def penalize(self, url: str, multiplier: float = 2.0) -> float:
+        """Double the delay for this domain (capped at max_delay_s). Returns new delay."""
+        domain = urlparse(url).hostname or url
+        with self._global:
+            current   = self._domain_delay.get(domain, self._base_delay)
+            new_delay = min(current * multiplier, self._max_delay)
+            self._domain_delay[domain] = new_delay
+        return new_delay
+
+    def set_retry_after(self, url: str, seconds: int) -> None:
+        """Freeze this domain for `seconds` seconds (from a Retry-After response header)."""
+        domain = urlparse(url).hostname or url
+        with self._global:
+            self._freeze_until[domain] = time.monotonic() + seconds
+        log.info("  [Retry-After] %s: pausing %ds before next request", domain, seconds)
+
+    def reset_penalty(self, url: str) -> None:
+        """Restore base delay for this domain after a successful fetch."""
+        domain = urlparse(url).hostname or url
+        with self._global:
+            self._domain_delay.pop(domain, None)
+
+    def get_delay(self, url: str) -> float:
+        """Return current effective delay for this domain."""
+        domain = urlparse(url).hostname or url
+        with self._global:
+            return self._domain_delay.get(domain, self._base_delay)
 
 
 # ══════════════════════════════════════════════
@@ -352,6 +407,7 @@ class FetchResult:
     latency_ms:   int        = 0
     redirected:   bool       = False
     error:        str | None = None
+    retry_after:  int | None = None  # seconds from Retry-After header (429 responses)
 
 
 def _extract_text_and_title(html: str) -> tuple[str, str]:
@@ -422,6 +478,12 @@ def fetch_page(
                 if resp.status_code == 403 and resp.cookies and attempt < MAX_RETRIES:
                     log.debug("403 with cookies on %s, retrying with WAF cookie", url)
                     continue
+                # Extract Retry-After for 429 Too Many Requests
+                retry_after: int | None = None
+                if resp.status_code == 429:
+                    ra_header = resp.headers.get("Retry-After", "")
+                    if ra_header.isdigit():
+                        retry_after = int(ra_header)
                 return FetchResult(
                     status_code=resp.status_code,
                     final_url=final_url,
@@ -429,6 +491,7 @@ def fetch_page(
                     latency_ms=latency_ms,
                     redirected=redirected,
                     error=f"HTTP {resp.status_code}",
+                    retry_after=retry_after,
                 )
 
             if "text/html" not in content_type:
@@ -542,6 +605,9 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
     skipped_robots: list[str]        = []
     domain_counts: dict[str, int]    = {}
     domain_graph:  dict[str, set[str]] = defaultdict(set)  # from_domain → {to_domain}
+    # Circuit breaker: track consecutive 4xx failures per domain
+    domain_consecutive_fails: dict[str, int] = {}
+    domain_blocked:           set[str]       = set()  # domains that tripped the breaker
 
     pages_crawled = 0
     in_flight     = 0  # futures currently running
@@ -570,6 +636,12 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
                     if pages_crawled + len(active_futures) >= CRAWL_MAX_PAGES:
                         break
                 item = pending_queue.popleft()
+
+                # Skip domains the circuit breaker has opened
+                item_domain = urlparse(item.url).hostname or ""
+                if item_domain in domain_blocked:
+                    log.debug("  [circuit-open] skipping blocked domain: %s", item.url)
+                    continue
 
                 # Robots check (fast, cached after first domain hit)
                 if not robots.can_fetch(item.url):
@@ -620,6 +692,40 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
                             "referrer":     item.referrer,
                             "attempted_at": now_utc,
                         }
+
+                    # ── Throttling: adaptive backoff + circuit breaker ──────
+                    if result.status_code in (403, 429) and domain:
+                        if result.retry_after:
+                            rate_limiter.set_retry_after(item.url, result.retry_after)
+                        else:
+                            new_delay = rate_limiter.penalize(item.url)
+                            log.debug(
+                                "  [throttle] %s: delay raised to %.1fs", domain, new_delay
+                            )
+                        with _state_lock:
+                            domain_consecutive_fails[domain] = (
+                                domain_consecutive_fails.get(domain, 0) + 1
+                            )
+                            consec = domain_consecutive_fails[domain]
+                            if (
+                                consec >= DOMAIN_CIRCUIT_BREAKER_THRESHOLD
+                                and domain not in domain_blocked
+                            ):
+                                domain_blocked.add(domain)
+                                # Drain this domain's remaining queue entries
+                                queue_before = len(pending_queue)
+                                filtered = deque(
+                                    i for i in pending_queue
+                                    if (urlparse(i.url).hostname or "") != domain
+                                )
+                                drained = queue_before - len(filtered)
+                                pending_queue.clear()
+                                pending_queue.extend(filtered)
+                                log.warning(
+                                    "  [CIRCUIT OPEN] %s: %d consecutive HTTP %d errors"
+                                    " — domain blocked, %d queued URLs drained",
+                                    domain, consec, result.status_code, drained,
+                                )
                     continue
 
                 # ── Successful HTML page ────────────────────────────────────
@@ -628,7 +734,10 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
                 word_count = len(text.split())
                 is_thin    = word_count < MIN_TEXT_WORDS
 
+                # Reset adaptive delay on success
+                rate_limiter.reset_penalty(item.url)
                 with _state_lock:
+                    domain_consecutive_fails.pop(domain, None)
                     pages_crawled += 1
                     domain_counts[domain] = domain_counts.get(domain, 0) + 1
                     pc = pages_crawled
@@ -733,10 +842,11 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
                 "max_workers":   CRAWL_MAX_WORKERS,
             },
             "summary": {
-                "pages_crawled":        pages_crawled,
-                "pages_failed":         len(failed),
-                "pages_skipped_robots": len(skipped_robots),
-                "urls_discovered":      len(visited),
+                "pages_crawled":          pages_crawled,
+                "pages_failed":           len(failed),
+                "pages_skipped_robots":   len(skipped_robots),
+                "urls_discovered":        len(visited),
+                "domains_circuit_broken": sorted(domain_blocked),
             },
             "pages_by_domain": domain_counts,
         },
@@ -753,13 +863,17 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
     log.info("")
     log.info("=" * 60)
     log.info(
-        "Crawl complete -- %d pages crawled, %d failed, %d robot-blocked",
-        pages_crawled, len(failed), len(skipped_robots),
+        "Crawl complete -- %d pages crawled, %d failed, %d robot-blocked, %d circuit-broken domains",
+        pages_crawled, len(failed), len(skipped_robots), len(domain_blocked),
     )
     log.info("Pages by domain:")
     for d, count in sorted(domain_counts.items(), key=lambda x: -x[1]):
         info = domain_summary[d]
         log.info("  %-45s  %4d page(s)  avg %dms", d, count, info["avg_latency_ms"])
+    if domain_blocked:
+        log.info("Circuit-broken domains (blocked after repeated 403/429 errors):")
+        for d in sorted(domain_blocked):
+            log.info("  %s", d)
     log.info("Results saved to %s (includes cached text for ETL reuse)", DISCOVERED_URLS_FILE)
     log.info("=" * 60)
 
