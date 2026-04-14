@@ -79,6 +79,21 @@ CRAWL_EXCLUDE_ENV = [
     p.strip() for p in os.environ.get("CRAWL_EXCLUDE_PATTERNS", "").split(",") if p.strip()
 ]
 
+# Domains that require a headless browser to pass WAF/JS challenges.
+# Example: CRAWL_PLAYWRIGHT_DOMAINS=prax.oregonstate.edu,secure.oregonstate.edu
+CRAWL_PLAYWRIGHT_DOMAINS: set[str] = {
+    d.strip().lower()
+    for d in os.environ.get("CRAWL_PLAYWRIGHT_DOMAINS", "").split(",")
+    if d.strip()
+}
+
+# Detect Playwright availability at import time (optional dependency)
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 REQUEST_TIMEOUT = 30
 MAX_RETRIES     = 2
 RETRY_BACKOFF   = 2
@@ -87,24 +102,30 @@ RETRY_BACKOFF   = 2
 # The domain is added to a blocklist and all queued URLs for it are drained.
 DOMAIN_CIRCUIT_BREAKER_THRESHOLD = int(os.environ.get("CRAWL_CIRCUIT_BREAKER_THRESHOLD", "5"))
 
+# Max simultaneous in-flight HTTP requests to the same domain across all workers.
+# 1 (default) matches the old single-threaded behaviour: at most one open connection
+# per domain at any moment, which is the most WAF-friendly setting.
+# Increase only if you know a domain tolerates parallel requests.
+CRAWL_MAX_DOMAIN_CONCURRENCY = int(os.environ.get("CRAWL_MAX_DOMAIN_CONCURRENCY", "1"))
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Headers that make requests look like a real browser navigation.
-# WAFs (Cloudflare, Akamai, etc.) flag requests that are missing these.
+# Minimal headers that don't lie about the client's identity.
+#
+# Sec-Fetch-* headers are intentionally omitted: they are Chrome-specific and
+# Akamai/Cloudflare cross-check them against the TLS JA3 fingerprint.  urllib3's
+# JA3 is nothing like Chrome's, so sending Sec-Fetch-Dest: document while having
+# a non-Chrome handshake is a strong bot signal.  The old single-threaded crawler
+# used only User-Agent and had zero 403s as a result.
 BROWSER_HEADERS: dict[str, str] = {
-    "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "User-Agent":      USER_AGENT,
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
 }
 
 # File extensions to skip (non-HTML resources)
@@ -152,6 +173,92 @@ def _get_session() -> requests.Session:
         sess.mount("http://", adapter)
         _thread_local.session = sess
     return _thread_local.session
+
+
+# ══════════════════════════════════════════════
+# Playwright (headless browser) support
+# ══════════════════════════════════════════════
+_pw_lock    = threading.Lock()
+_pw_handle  = None   # playwright instance (singleton)
+_pw_browser = None   # chromium browser (singleton, shared across threads)
+
+
+def _get_pw_page():
+    """Return a per-thread Playwright page backed by a shared Chromium browser.
+
+    The browser process is launched once (lazily) and shared.  Each worker
+    thread gets its own BrowserContext + Page so sessions/cookies are isolated.
+    Raises RuntimeError if playwright is not installed.
+    """
+    global _pw_handle, _pw_browser
+    if not PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError(
+            "playwright is not installed. Run:\n"
+            "  pip install playwright && playwright install chromium"
+        )
+    if not hasattr(_thread_local, "pw_page"):
+        if _pw_browser is None:
+            with _pw_lock:
+                if _pw_browser is None:
+                    _pw_handle  = _sync_playwright().start()
+                    _pw_browser = _pw_handle.chromium.launch(headless=True)
+        ctx = _pw_browser.new_context(
+            user_agent=USER_AGENT,
+            extra_http_headers={
+                "Accept":          BROWSER_HEADERS["Accept"],
+                "Accept-Language": BROWSER_HEADERS["Accept-Language"],
+            },
+        )
+        _thread_local.pw_page = ctx.new_page()
+    return _thread_local.pw_page
+
+
+def fetch_page_playwright(url: str, referrer: str | None = None) -> "FetchResult":
+    """Fetch a page using headless Chromium — passes WAF JS challenges that
+    requests/urllib3 cannot solve.  Used when a domain is listed in
+    CRAWL_PLAYWRIGHT_DOMAINS.
+    """
+    t0 = time.monotonic()
+    try:
+        page = _get_pw_page()
+        if referrer and referrer != "[seed]":
+            page.set_extra_http_headers({"Referer": referrer})
+
+        response = page.goto(url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT * 1000)
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
+        if response is None:
+            return FetchResult(error="playwright: no response", latency_ms=latency_ms)
+
+        status    = response.status
+        final_url = page.url
+        redirected = final_url.rstrip("/") != url.rstrip("/")
+
+        if status >= 400:
+            return FetchResult(
+                status_code=status,
+                final_url=final_url,
+                latency_ms=latency_ms,
+                redirected=redirected,
+                error=f"HTTP {status}",
+            )
+
+        html = page.content()
+        title, text = _extract_text_and_title(html)
+
+        return FetchResult(
+            html=html,
+            text=text,
+            title=title,
+            status_code=status,
+            final_url=final_url,
+            latency_ms=latency_ms,
+            redirected=redirected,
+        )
+    except Exception as exc:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        log.debug("Playwright fetch failed for %s: %s", url, exc)
+        return FetchResult(error=f"playwright: {exc}", latency_ms=latency_ms)
 
 
 # ══════════════════════════════════════════════
@@ -321,14 +428,17 @@ class DomainRateLimiter:
         delay_s: float = CRAWL_DELAY,
         jitter_s: float = CRAWL_JITTER,
         max_delay_s: float = 60.0,
+        max_concurrency: int = CRAWL_MAX_DOMAIN_CONCURRENCY,
     ) -> None:
         self._base_delay    = delay_s
         self._jitter        = jitter_s
         self._max_delay     = max_delay_s
+        self._max_concurrency = max_concurrency
         self._last:         dict[str, float] = {}
         self._domain_delay: dict[str, float] = {}   # per-domain adaptive delay
         self._freeze_until: dict[str, float] = {}   # absolute monotonic freeze time (Retry-After)
         self._locks:        dict[str, threading.Lock] = {}
+        self._slots:        dict[str, threading.Semaphore] = {}  # per-domain concurrency slots
         self._global        = threading.Lock()
 
     def _domain_lock(self, domain: str) -> threading.Lock:
@@ -391,6 +501,28 @@ class DomainRateLimiter:
         with self._global:
             return self._domain_delay.get(domain, self._base_delay)
 
+    def _domain_semaphore(self, domain: str) -> threading.Semaphore:
+        with self._global:
+            if domain not in self._slots:
+                self._slots[domain] = threading.Semaphore(self._max_concurrency)
+            return self._slots[domain]
+
+    def acquire_slot(self, url: str) -> None:
+        """Block until a concurrency slot is free for this domain.
+
+        With max_concurrency=1 (default) this ensures at most one in-flight
+        request per domain at a time — the same guarantee as the original
+        single-threaded crawler, without sacrificing cross-domain parallelism.
+        Always pair with release_slot() in a finally block.
+        """
+        domain = urlparse(url).hostname or url
+        self._domain_semaphore(domain).acquire()
+
+    def release_slot(self, url: str) -> None:
+        """Release the concurrency slot for this domain."""
+        domain = urlparse(url).hostname or url
+        self._domain_semaphore(domain).release()
+
 
 # ══════════════════════════════════════════════
 # Fetcher
@@ -423,29 +555,10 @@ def _extract_text_and_title(html: str) -> tuple[str, str]:
 
 
 def _build_headers(url: str, referrer: str | None) -> dict[str, str]:
-    """Build request headers with correct Referer and Sec-Fetch-Site for this navigation."""
+    """Build request headers. Adds Referer when navigating from another page."""
     headers = dict(BROWSER_HEADERS)
-    if not referrer or referrer == "[seed]":
-        headers["Sec-Fetch-Site"] = "none"
-        return headers
-
-    ref_host = urlparse(referrer).hostname or ""
-    req_host = urlparse(url).hostname or ""
-
-    # Determine eTLD+1 by taking last two labels (works for .edu)
-    def etld1(host: str) -> str:
-        parts = host.split(".")
-        return ".".join(parts[-2:]) if len(parts) >= 2 else host
-
-    if ref_host == req_host:
-        fetch_site = "same-origin"
-    elif etld1(ref_host) == etld1(req_host):
-        fetch_site = "same-site"
-    else:
-        fetch_site = "cross-site"
-
-    headers["Sec-Fetch-Site"] = fetch_site
-    headers["Referer"] = referrer
+    if referrer and referrer != "[seed]":
+        headers["Referer"] = referrer
     return headers
 
 
@@ -454,7 +567,37 @@ def fetch_page(
     rate_limiter: DomainRateLimiter | None = None,
     referrer: str | None = None,
 ) -> FetchResult:
-    """Fetch a page with retries. Respects domain rate limiter if provided."""
+    """Fetch a page with retries. Respects domain rate limiter if provided.
+
+    Acquires a per-domain concurrency slot before fetching (always released in
+    a finally block) so that at most CRAWL_MAX_DOMAIN_CONCURRENCY requests are
+    in-flight to any single domain at the same time.
+
+    For domains listed in CRAWL_PLAYWRIGHT_DOMAINS the request is routed
+    through a headless Chromium browser so that WAF JS challenges are solved
+    automatically.  The rate limiter still applies.
+    """
+    if rate_limiter:
+        rate_limiter.acquire_slot(url)
+    try:
+        return _fetch_page_inner(url, rate_limiter=rate_limiter, referrer=referrer)
+    finally:
+        if rate_limiter:
+            rate_limiter.release_slot(url)
+
+
+def _fetch_page_inner(
+    url: str,
+    rate_limiter: DomainRateLimiter | None = None,
+    referrer: str | None = None,
+) -> FetchResult:
+    domain = urlparse(url).hostname or ""
+    if domain in CRAWL_PLAYWRIGHT_DOMAINS:
+        if rate_limiter:
+            rate_limiter.wait(url)
+        log.debug("  [playwright] %s", url)
+        return fetch_page_playwright(url, referrer=referrer)
+
     headers = _build_headers(url, referrer)
     for attempt in range(1, MAX_RETRIES + 1):
         if rate_limiter:

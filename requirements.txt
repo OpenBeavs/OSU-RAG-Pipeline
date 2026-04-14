@@ -16,5 +16,9 @@ beautifulsoup4==4.13.3
 requests==2.32.3
 lxml==5.3.1
 
+# --- Headless browser (optional: needed for WAF/JS-challenge domains) ---
+# After pip install, also run: playwright install chromium
+playwright>=1.44.0
+
 # --- Environment ---
 python-dotenv==1.0.1

@@ -69,14 +69,18 @@ Document ID format: `{md5(url)[:12]}#{chunk_index}` — enables prefix-based sta
 
 ### Crawler (`crawler.py`)
 
-Parallel BFS using `ThreadPoolExecutor` (`CRAWL_MAX_WORKERS`, default 10) with per-domain rate limiting (`DomainRateLimiter`). Key behaviors:
+Parallel BFS using `ThreadPoolExecutor` (`CRAWL_MAX_WORKERS`, default 5) with per-domain rate limiting (`DomainRateLimiter`). Key behaviors:
 
 - Scoped to `*.oregonstate.edu` (configurable via `BASE_URL_TO_SCRAPE`)
 - Skips non-HTML extensions, low-quality URL slugs (numeric IDs ≥4 digits, UUIDs, hex hashes, paths ≥8 segments)
 - "Thin" pages (<80 words) are recorded but their outbound links are not enqueued
 - Exclusion patterns loaded from `url_exclusions.txt` and `CRAWL_EXCLUDE_PATTERNS` env var
 - Robots.txt checked per domain with caching; domains that block root are assumed allow-all (login redirect detection)
-- Sets `Referer` and `Sec-Fetch-Site` headers dynamically based on the referring page to avoid WAF 403s
+- Uses minimal headers (User-Agent, Accept, Accept-Language, optional Referer) — Sec-Fetch-* headers are intentionally omitted because urllib3's TLS fingerprint doesn't match Chrome, making those headers a bot signal to Akamai/Cloudflare
+- Per-domain concurrency slot (`CRAWL_MAX_DOMAIN_CONCURRENCY`, default 1) ensures at most one in-flight request per domain at a time, matching the WAF-friendly behaviour of the original single-threaded crawler
+- Circuit breaker: after `CRAWL_CIRCUIT_BREAKER_THRESHOLD` (default 5) consecutive 4xx errors, a domain is blocked and its pending queue entries are drained
+- Adaptive backoff: delay doubles per domain on 4xx errors (capped at 60s); resets on success
+- Optional Playwright fallback for WAF/JS-challenge domains (`CRAWL_PLAYWRIGHT_DOMAINS` env var)
 - Tracks `domain_graph` — a `{from_domain: [to_domain]}` map of all inter-domain links observed during the crawl
 - Outputs `discovered_urls.json` — the ETL pipeline reads this to skip re-fetching crawled pages
 
@@ -108,12 +112,16 @@ Wraps `gcloud run deploy --source=<agent_dir>` with auto-detected project/region
 |---|---|---|
 | `CRAWL_MAX_DEPTH` | `3` | BFS link depth |
 | `CRAWL_MAX_PAGES` | `2000` | Hard cap |
-| `CRAWL_DELAY` | `0.5` | Seconds between requests per domain |
-| `CRAWL_MAX_WORKERS` | `20` | Concurrent crawler threads |
+| `CRAWL_DELAY` | `1.0` | Seconds between requests per domain |
+| `CRAWL_JITTER` | `0.5` | ± random jitter added to delay |
+| `CRAWL_MAX_WORKERS` | `5` | Concurrent crawler threads |
+| `CRAWL_MAX_DOMAIN_CONCURRENCY` | `1` | Max simultaneous in-flight requests per domain |
 | `ETL_MAX_WORKERS` | `10` | Concurrent ETL threads |
 | `CRAWL_RESPECT_ROBOTS` | `true` | Set `false` to bypass robots.txt globally |
 | `CRAWL_ROBOTS_IGNORE_DOMAINS` | `""` | Comma-separated domains to bypass |
 | `CRAWL_MIN_WORDS` | `80` | Minimum words for non-thin pages |
+| `CRAWL_CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive 4xx errors before blocking a domain |
+| `CRAWL_PLAYWRIGHT_DOMAINS` | `""` | Comma-separated domains to fetch via headless browser |
 
 ## Important Files
 
