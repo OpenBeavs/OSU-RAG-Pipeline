@@ -47,6 +47,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 URLS_FILE = ROOT_DIR / "urls.txt"
 DISCOVERED_URLS_FILE = ROOT_DIR / "discovered_urls.json"
 EXCLUSIONS_FILE = ROOT_DIR / "url_exclusions.txt"
+CRAWL_CTRL_FILE = ROOT_DIR / "crawl_ctrl.txt"
 
 CRAWL_MAX_DEPTH   = int(os.environ.get("CRAWL_MAX_DEPTH", "3"))
 CRAWL_MAX_PAGES   = int(os.environ.get("CRAWL_MAX_PAGES", "5000"))
@@ -152,6 +153,139 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("osu-crawler")
+
+
+# ══════════════════════════════════════════════
+# Interactive Crawl Controller
+# ══════════════════════════════════════════════
+class CrawlController:
+    """
+    Reads operator commands from stdin in a daemon thread while the crawl runs.
+
+    Commands (press Enter after each):
+      skip domain <domain>   — block all URLs on a domain immediately
+      skip path   <prefix>   — skip any URL whose path contains this prefix
+      skip url    <pattern>  — skip any URL whose full string contains this pattern
+      status                 — print current progress counts
+      embed                  — stop crawling now and begin embeddings
+      stop                   — stop crawling (no embeddings)
+
+    The crawl loop checks `stop_requested` between URL dispatches, so commands
+    take effect within a few seconds rather than instantly.
+    """
+
+    _HELP = (
+        "\n  ┌─ Crawl controller ready ─────────────────────────────────────────────┐\n"
+        "  │  Commands — type in this terminal OR write to crawl_ctrl.txt + save  │\n"
+        "  │                                                                       │\n"
+        "  │  skip domain <domain>   block a domain right now                     │\n"
+        "  │  skip path   <prefix>   skip URLs whose path contains prefix         │\n"
+        "  │  skip url    <pattern>  skip URLs matching this substring             │\n"
+        "  │  status                 show progress counts                         │\n"
+        "  │  embed                  stop crawl → start embeddings now            │\n"
+        "  │  stop                   stop crawl, no embeddings                    │\n"
+        "  │                                                                       │\n"
+        "  │  From another terminal:  echo embed > crawl_ctrl.txt                 │\n"
+        "  └───────────────────────────────────────────────────────────────────────┘\n"
+    )
+
+    def __init__(self) -> None:
+        self.stop_requested  = threading.Event()
+        self.embed_requested = threading.Event()
+        self._lock           = threading.Lock()
+        self._exclusions:      list[str] = []
+        self._blocked_domains: set[str]  = set()
+        self._status_fn      = None   # injected by crawl() before start()
+
+    def start(self, status_fn=None) -> None:
+        """Spawn the background stdin-reader thread and print the help banner."""
+        self._status_fn = status_fn
+        t = threading.Thread(target=self._loop, daemon=True, name="crawl-ctrl")
+        t.start()
+        print(self._HELP, flush=True)
+
+    def _loop(self) -> None:
+        # sys.stdin.readline() is used instead of input() because input() relies
+        # on Python's readline library which is not safe to call from non-main
+        # threads on Windows/WSL — it can silently drop typed text.
+        while not self.stop_requested.is_set():
+            try:
+                line = sys.stdin.readline()
+                if not line:   # EOF
+                    break
+            except OSError:
+                break
+            self._handle(line.strip())
+
+    def _handle(self, line: str) -> None:
+        if not line:
+            return
+        parts = line.split(None, 2)
+        cmd   = parts[0].lower()
+
+        if cmd == "stop":
+            self.stop_requested.set()
+            log.info("[CTRL] Stop requested — finishing in-flight requests…")
+        elif cmd == "embed":
+            self.embed_requested.set()
+            self.stop_requested.set()
+            log.info("[CTRL] Embed requested — stopping crawl, will proceed to embeddings")
+        elif cmd == "skip" and len(parts) >= 3:
+            kind    = parts[1].lower()
+            pattern = parts[2].strip()
+            with self._lock:
+                if kind == "domain":
+                    self._blocked_domains.add(pattern.lower())
+                    log.info("[CTRL] Blocked domain: %s", pattern)
+                else:
+                    self._exclusions.append(pattern)
+                    log.info("[CTRL] Added %s exclusion pattern: %s", kind, pattern)
+        elif cmd == "status":
+            if self._status_fn:
+                log.info("[CTRL] %s", self._status_fn())
+            else:
+                log.info("[CTRL] Status not available yet")
+        else:
+            log.info(
+                "[CTRL] Unknown command %r — try: skip domain/path/url <value>, embed, stop, status",
+                line,
+            )
+
+    # ── query methods (called from crawler threads) ──────────────────────────
+
+    def is_url_excluded(self, url: str) -> bool:
+        """Return True if the URL matches any runtime-added exclusion pattern."""
+        with self._lock:
+            url_lower = url.lower()
+            return any(pat.lower() in url_lower for pat in self._exclusions)
+
+    def is_domain_blocked(self, domain: str) -> bool:
+        """Return True if the domain was blocked via a runtime 'skip domain' command."""
+        with self._lock:
+            return domain.lower() in self._blocked_domains
+
+    def check_ctrl_file(self, path: Path) -> None:
+        """Read one command from a control file and clear it.
+
+        More reliable than stdin on Windows/WSL: the user can write a command
+        with  echo embed > crawl_ctrl.txt  from any terminal window.
+        Called from the main BFS loop after each wait cycle.
+        """
+        if not path.exists():
+            return
+        try:
+            text = path.read_text(encoding="utf-8")
+            # Clear immediately so the same command isn't replayed on the next poll
+            path.write_text("", encoding="utf-8")
+            for line in text.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    log.info("[CTRL] (from file) %s", line)
+                    self._handle(line)
+                    break
+        except OSError:
+            pass
+
 
 # ──────────────────────────────────────────────
 # Thread-local HTTP session (connection pooling)
@@ -412,6 +546,22 @@ class RobotsChecker:
 # ══════════════════════════════════════════════
 # Domain-level Rate Limiter
 # ══════════════════════════════════════════════
+def _apex_key(url: str) -> str:
+    """Return the registrable domain (last two hostname labels) for rate-limiting.
+
+    Groups all subdomains under one shared clock so the crawler never exceeds
+    its configured delay from a single IP — critical for WAFs that rate-limit
+    at the apex-domain / IP level rather than per-subdomain.
+
+    engineering.oregonstate.edu → oregonstate.edu
+    oregonstate.edu             → oregonstate.edu
+    localhost                   → localhost
+    """
+    hostname = urlparse(url).hostname or url
+    parts = hostname.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else hostname
+
+
 class DomainRateLimiter:
     """
     Enforces a minimum delay between fetches to the same domain.
@@ -449,7 +599,7 @@ class DomainRateLimiter:
 
     def wait(self, url: str) -> None:
         """Block until it is polite to fetch `url`, honoring rate limit and any freeze."""
-        domain = urlparse(url).hostname or url
+        domain = _apex_key(url)
         lock   = self._domain_lock(domain)
         with lock:
             # Snapshot adaptive state under global lock (don't hold it during sleep)
@@ -475,7 +625,7 @@ class DomainRateLimiter:
 
     def penalize(self, url: str, multiplier: float = 2.0) -> float:
         """Double the delay for this domain (capped at max_delay_s). Returns new delay."""
-        domain = urlparse(url).hostname or url
+        domain = _apex_key(url)
         with self._global:
             current   = self._domain_delay.get(domain, self._base_delay)
             new_delay = min(current * multiplier, self._max_delay)
@@ -484,20 +634,20 @@ class DomainRateLimiter:
 
     def set_retry_after(self, url: str, seconds: int) -> None:
         """Freeze this domain for `seconds` seconds (from a Retry-After response header)."""
-        domain = urlparse(url).hostname or url
+        domain = _apex_key(url)
         with self._global:
             self._freeze_until[domain] = time.monotonic() + seconds
         log.info("  [Retry-After] %s: pausing %ds before next request", domain, seconds)
 
     def reset_penalty(self, url: str) -> None:
         """Restore base delay for this domain after a successful fetch."""
-        domain = urlparse(url).hostname or url
+        domain = _apex_key(url)
         with self._global:
             self._domain_delay.pop(domain, None)
 
     def get_delay(self, url: str) -> float:
         """Return current effective delay for this domain."""
-        domain = urlparse(url).hostname or url
+        domain = _apex_key(url)
         with self._global:
             return self._domain_delay.get(domain, self._base_delay)
 
@@ -707,7 +857,10 @@ class _WorkItem:
     referrer: str
 
 
-def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
+def crawl(
+    seed_urls:  list[str] | None = None,
+    controller: CrawlController | None = None,
+) -> dict[str, Any]:
     """
     Parallel BFS crawl starting from seed URLs.
 
@@ -715,12 +868,19 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
     pages are fetched concurrently while per-domain rate limiting keeps
     the crawl polite.
 
+    An optional CrawlController enables interactive mid-crawl commands
+    (skip domain/path/url, stop, embed).  If none is provided a fresh one
+    is created and its stdin thread is started automatically.
+
     Returns a dict of {url: metadata} for all successfully crawled URLs.
     The metadata includes 'text' and 'title' so the ETL pipeline can skip
     re-fetching pages that were already fetched during crawling.
     """
     if seed_urls is None:
         seed_urls = load_seed_urls()
+
+    if controller is None:
+        controller = CrawlController()
 
     if not seed_urls:
         log.warning("No seed URLs provided.")
@@ -757,6 +917,20 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
 
     crawl_started_at = datetime.now(timezone.utc).isoformat()
 
+    # Start controller after state is initialised so the status callback can close over
+    # the shared counters.  active_futures is defined later; wrap in a list so the
+    # lambda sees the live reference once the inner scope creates it.
+    _af_holder: list[dict] = [{}]
+
+    def _status() -> str:
+        return (
+            f"pages_crawled={pages_crawled}, "
+            f"queue={len(pending_queue)}, "
+            f"in_flight={len(_af_holder[0])}"
+        )
+
+    controller.start(status_fn=_status)
+
     # Seed the queue
     for url in seed_urls:
         norm = normalize_url(url)
@@ -770,20 +944,31 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
 
     with ThreadPoolExecutor(max_workers=CRAWL_MAX_WORKERS) as executor:
         active_futures: dict[Future, _WorkItem] = {}
+        _af_holder[0] = active_futures  # let status callback see live count
 
         def _submit_pending() -> None:
             """Submit as many queued items as we have worker budget for."""
             nonlocal pages_crawled
+            # Honour a user-requested stop: drain the queue and submit nothing new.
+            if controller.stop_requested.is_set():
+                pending_queue.clear()
+                return
             while pending_queue:
                 with _state_lock:
                     if pages_crawled + len(active_futures) >= CRAWL_MAX_PAGES:
                         break
                 item = pending_queue.popleft()
 
-                # Skip domains the circuit breaker has opened
+                # Skip domains the circuit breaker or the operator has blocked
                 item_domain = urlparse(item.url).hostname or ""
-                if item_domain in domain_blocked:
-                    log.debug("  [circuit-open] skipping blocked domain: %s", item.url)
+                if item_domain in domain_blocked or controller.is_domain_blocked(item_domain):
+                    log.debug("  [blocked] skipping domain: %s", item.url)
+                    continue
+
+                # Skip URLs matching runtime operator exclusions
+                if controller.is_url_excluded(item.url):
+                    log.debug("  [ctrl-excluded] %s", item.url)
+                    visited.add(item.url)
                     continue
 
                 # Robots check (fast, cached after first domain hit)
@@ -799,6 +984,14 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
         _submit_pending()
 
         while active_futures:
+            # When a stop is requested clear the queue so no new work gets submitted,
+            # then let in-flight futures finish naturally.
+            if controller.stop_requested.is_set():
+                pending_queue.clear()
+
+            # Poll the control file (reliable on WSL/Windows where stdin threads can drop input)
+            controller.check_ctrl_file(CRAWL_CTRL_FILE)
+
             # Block until at least one future finishes (no busy-wait / sleep loop).
             done_set, _ = cf_wait(list(active_futures.keys()), return_when=FIRST_COMPLETED, timeout=1.0)
 
@@ -908,8 +1101,12 @@ def crawl(seed_urls: list[str] | None = None) -> dict[str, Any]:
                                     log.debug("  [lq-url] %s -- %s", lq, link)
                                     visited.add(link)
                                     continue
-                                if is_excluded_url(link):
+                                if is_excluded_url(link) or controller.is_url_excluded(link):
                                     log.debug("  [excluded] %s", link)
+                                    visited.add(link)
+                                    continue
+                                if controller.is_domain_blocked(link_domain):
+                                    log.debug("  [ctrl-blocked] %s", link)
                                     visited.add(link)
                                     continue
                                 visited.add(link)

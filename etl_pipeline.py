@@ -444,8 +444,15 @@ def run_pipeline(dry_run: bool = False, use_crawler: bool = False) -> None:
     # --- crawl (if requested) ---
     url_cache: dict[str, dict[str, Any]] = {}
     if use_crawler:
-        from crawler import crawl
-        crawl()
+        from crawler import crawl, CrawlController
+        ctrl = CrawlController()
+        crawl(controller=ctrl)
+        # If the operator typed 'stop' (not 'embed'), honour the request and exit.
+        if ctrl.stop_requested.is_set() and not ctrl.embed_requested.is_set():
+            log.info("Crawl stopped by operator — skipping embeddings. Discovered URLs saved to %s", DISCOVERED_URLS_FILE)
+            return
+        if ctrl.embed_requested.is_set():
+            log.info("Early embed triggered — proceeding to embeddings with URLs discovered so far")
         url_cache = load_discovered_urls()
         urls      = list(url_cache.keys())
         source    = DISCOVERED_URLS_FILE
