@@ -599,13 +599,15 @@ class DomainRateLimiter:
 
     def wait(self, url: str) -> None:
         """Block until it is polite to fetch `url`, honoring rate limit and any freeze."""
-        domain = _apex_key(url)
-        lock   = self._domain_lock(domain)
+        apex = _apex_key(url)
+        host = urlparse(url).hostname or apex
+        # Timing lock is apex-keyed: enforces cross-subdomain spacing (WAF-friendly).
+        lock = self._domain_lock(apex)
         with lock:
-            # Snapshot adaptive state under global lock (don't hold it during sleep)
             with self._global:
-                freeze = self._freeze_until.get(domain, 0.0)
-                delay  = self._domain_delay.get(domain, self._base_delay)
+                freeze = self._freeze_until.get(apex, 0.0)
+                # Per-hostname penalty takes priority; fall back to apex, then base.
+                delay  = self._domain_delay.get(host, self._domain_delay.get(apex, self._base_delay))
 
             now = time.monotonic()
             if now < freeze:
@@ -613,43 +615,47 @@ class DomainRateLimiter:
                 now = time.monotonic()
 
             if delay <= 0:
-                self._last[domain] = now
+                self._last[apex] = now
                 return
-            elapsed = now - self._last.get(domain, 0.0)
+            elapsed = now - self._last.get(apex, 0.0)
             wait_s  = delay - elapsed
             if self._jitter > 0:
                 wait_s += random.uniform(0, self._jitter)
             if wait_s > 0:
                 time.sleep(wait_s)
-            self._last[domain] = time.monotonic()
+            self._last[apex] = time.monotonic()
 
     def penalize(self, url: str, multiplier: float = 2.0) -> float:
-        """Double the delay for this domain (capped at max_delay_s). Returns new delay."""
-        domain = _apex_key(url)
+        """Double the delay for this hostname (capped at max_delay_s). Returns new delay.
+
+        Keyed per-hostname (not apex) so one WAF-blocking subdomain doesn't
+        slow down the entire *.oregonstate.edu crawl.
+        """
+        host = urlparse(url).hostname or _apex_key(url)
         with self._global:
-            current   = self._domain_delay.get(domain, self._base_delay)
+            current   = self._domain_delay.get(host, self._base_delay)
             new_delay = min(current * multiplier, self._max_delay)
-            self._domain_delay[domain] = new_delay
+            self._domain_delay[host] = new_delay
         return new_delay
 
     def set_retry_after(self, url: str, seconds: int) -> None:
-        """Freeze this domain for `seconds` seconds (from a Retry-After response header)."""
+        """Freeze this apex domain for `seconds` seconds (from a Retry-After header)."""
         domain = _apex_key(url)
         with self._global:
             self._freeze_until[domain] = time.monotonic() + seconds
         log.info("  [Retry-After] %s: pausing %ds before next request", domain, seconds)
 
     def reset_penalty(self, url: str) -> None:
-        """Restore base delay for this domain after a successful fetch."""
-        domain = _apex_key(url)
+        """Restore base delay for this hostname after a successful fetch."""
+        host = urlparse(url).hostname or _apex_key(url)
         with self._global:
-            self._domain_delay.pop(domain, None)
+            self._domain_delay.pop(host, None)
 
     def get_delay(self, url: str) -> float:
-        """Return current effective delay for this domain."""
-        domain = _apex_key(url)
+        """Return current effective delay for this hostname."""
+        host = urlparse(url).hostname or _apex_key(url)
         with self._global:
-            return self._domain_delay.get(domain, self._base_delay)
+            return self._domain_delay.get(host, self._base_delay)
 
     def _domain_semaphore(self, domain: str) -> threading.Semaphore:
         with self._global:

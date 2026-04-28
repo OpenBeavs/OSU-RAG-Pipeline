@@ -30,11 +30,12 @@ cas.oregonstate.edu
 /auth/
 
 # ── User-generated / profile pages (high volume, low knowledge value) ─────────
-# /users/
-# /user/
-# /profile/
-# /people/
-# /faculty-staff/  # individual staff pages are auto-generated at scale
+# These paths return 403 on most subdomains and contain no RAG-useful content.
+/users/
+/user/
+/profile/
+/people/
+/faculty-staff/
 
 # ── Admin & internal tooling ─────────────────────────────────────────────────
 /admin/
@@ -120,5 +121,10 @@ share?
 ?fbclid=
 ?gclid=
 ?mc_eid=
+
+# ── Domains that only serve media / cause SSL errors on ARM ──────────────────
+# media.oregonstate.edu serves Kaltura video URLs (/media/t/...) — not HTML,
+# and the intermediate certificate fails on Raspberry Pi's cert store.
+media.oregonstate.edu
 
 # ── Add additional exclusions below ──────────────────────────────────────────
