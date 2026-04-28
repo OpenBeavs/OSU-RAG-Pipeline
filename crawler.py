@@ -963,6 +963,11 @@ def crawl(
                 with _state_lock:
                     if pages_crawled + len(active_futures) >= CRAWL_MAX_PAGES:
                         break
+                # Keep active_futures small so stop/embed drains within seconds,
+                # not hours. CRAWL_MAX_WORKERS * 2 gives each worker one item
+                # queued ahead while bounding worst-case drain to ~2 * max_delay.
+                if len(active_futures) >= CRAWL_MAX_WORKERS * 2:
+                    break
                 item = pending_queue.popleft()
 
                 # Skip domains the circuit breaker or the operator has blocked
