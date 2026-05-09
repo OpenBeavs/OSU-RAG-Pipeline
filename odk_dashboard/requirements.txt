@@ -1,0 +1,16 @@
+# ODK Dashboard — standalone MVP
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+jinja2>=3.1.4
+aiofiles>=23.2.1
+pdfplumber>=0.11.0
+python-dotenv>=1.0.1
+langchain-text-splitters>=0.2.0
+tiktoken>=0.7.0
+google-genai>=1.5.0
+google-cloud-firestore>=2.19.0
+# Web crawl dependencies
+requests>=2.32.0
+beautifulsoup4>=4.12.0
+lxml>=5.2.0
