@@ -126,6 +126,7 @@
               {% elif run.doc_status == "failed" %}
               <div class="w-2 h-2 rounded-full bg-red-500"></div>
               <span class="text-xs text-red-400">Failed</span>
+              {% if run.error %}<span class="text-xs text-red-500 ml-1 truncate max-w-xs" title="{{ run.error }}">— {{ run.error[:80] }}{% if run.error|length > 80 %}…{% endif %}</span>{% endif %}
               {% else %}
               <div class="w-2 h-2 rounded-full bg-gray-600"></div>
               <span class="text-xs text-gray-500">Queued</span>
@@ -148,6 +149,7 @@
               {% elif run.web_status == "failed" %}
               <div class="w-2 h-2 rounded-full bg-red-500"></div>
               <span class="text-xs text-red-400">Failed</span>
+              {% if run.error and run.doc_status != "failed" %}<span class="text-xs text-red-500 ml-1 truncate max-w-xs" title="{{ run.error }}">— {{ run.error[:80] }}{% if run.error|length > 80 %}…{% endif %}</span>{% endif %}
               {% else %}
               <div class="w-2 h-2 rounded-full bg-gray-600"></div>
               <span class="text-xs text-gray-500">Queued</span>
@@ -306,7 +308,7 @@ async function fetchAndRenderPages(subId) {
 }
 
 // ── Live polling for running submissions ──────────────────────────────────────
-function fmtStatus(status, vectors) {
+function fmtStatus(status, errorMsg) {
   const dot = status === 'done'
     ? '<span class="inline-block w-2 h-2 rounded-full bg-green-500 mr-1.5"></span>'
     : status === 'running'
@@ -316,7 +318,10 @@ function fmtStatus(status, vectors) {
     : '<span class="inline-block w-2 h-2 rounded-full bg-gray-600 mr-1.5"></span>';
   const label = {done:'Done', running:'Running…', failed:'Failed', pending:'Queued'}[status] || status;
   const colour = {done:'text-green-400', running:'text-yellow-400', failed:'text-red-400'}[status] || 'text-gray-500';
-  return dot + `<span class="text-xs ${colour}">${label}</span>`;
+  const errHtml = (status === 'failed' && errorMsg)
+    ? ` <span class="text-xs text-red-500 ml-1" title="${errorMsg.replace(/"/g,'&quot;')}">— ${errorMsg.substring(0,100)}${errorMsg.length>100?'…':''}</span>`
+    : '';
+  return dot + `<span class="text-xs ${colour}">${label}</span>` + errHtml;
 }
 
 function updateCrawlUI(subId, data) {
@@ -333,15 +338,15 @@ function updateCrawlUI(subId, data) {
     <div class="flex flex-wrap items-start gap-6">
       <div class="min-w-[140px]">
         <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Document</p>
-        <div class="flex items-center gap-1.5">
-          ${fmtStatus(data.doc_status)}
+        <div class="flex items-center gap-1.5 flex-wrap">
+          ${fmtStatus(data.doc_status, data.doc_status === 'failed' ? data.error : null)}
           ${data.doc_status === 'done' ? `<span class="text-xs text-gray-600 ml-1">· ${data.doc_vectors} vectors</span>` : ''}
         </div>
       </div>
       <div class="min-w-[260px]">
         <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Web crawl</p>
-        <div class="flex items-center gap-1.5">
-          ${fmtStatus(data.web_status)}
+        <div class="flex items-center gap-1.5 flex-wrap">
+          ${fmtStatus(data.web_status, data.web_status === 'failed' && data.doc_status !== 'failed' ? data.error : null)}
           <span class="text-xs text-gray-600 ml-1">
             · ${data.pages_indexed}/${data.pages_found} pages
             ${data.web_status === 'done' ? `· ${data.web_vectors} vectors` : ''}

@@ -76,6 +76,17 @@ templates.env.filters["fmt_time"] = _fmt_time
 
 def _run_indexing(sub_id: str, file_path: str, department_url: str) -> None:
     """Index the uploaded document AND crawl the department's web subtree."""
+    try:
+        _run_indexing_inner(sub_id, file_path, department_url)
+    except Exception as exc:
+        log.exception("submission %s — unhandled crash in background task", sub_id)
+        db.upsert_crawl_run(
+            sub_id, doc_status="failed", web_status="failed",
+            error=str(exc), finished_at=int(time.time()),
+        )
+
+
+def _run_indexing_inner(sub_id: str, file_path: str, department_url: str) -> None:
     from odk_pipeline import ingest_document, crawl_and_index_department
 
     db.upsert_crawl_run(sub_id, doc_status="running", started_at=int(time.time()))

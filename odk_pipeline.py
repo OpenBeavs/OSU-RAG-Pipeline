@@ -32,6 +32,7 @@ import argparse
 import hashlib
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -68,6 +69,22 @@ CRAWL_HEADERS = {
     "User-Agent": "Mozilla/5.0 (ODK-Crawler/1.0; +https://openbeavs.oregonstate.edu)",
     "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Rate-limiting defaults (overridable via env vars)
+CRAWL_DELAY = float(os.environ.get("ODK_CRAWL_DELAY", "1.0"))
+CRAWL_JITTER = float(os.environ.get("ODK_CRAWL_JITTER", "0.5"))
+CRAWL_MAX_DELAY = float(os.environ.get("ODK_CRAWL_MAX_DELAY", "30.0"))
+
+# URL path substrings that indicate non-content pages — skip to avoid crawling
+# noise and wasting crawl budget on 403-heavy paths.
+SKIP_URL_PATTERNS = {
+    "/tags/", "/tag/", "/topic/", "/author/", "/tncms/", "/boilerplate/",
+    "/partners/video-elephant/", "/search/", "/rss-", "/subscribe", "/eedition",
+    "/weather", "/watch", "/events", "/archive", "/contacts", "/journalists",
+    "/faculty-and-staff", "/news/local/", "/news/nation-world/", "/news/wildfires/",
+    "/news/video_", "/sports/", "/corvallis/news/", "/article_", "/gallery/",
+    "/organization/", "/en/search/",
 }
 
 
@@ -258,8 +275,8 @@ def ingest_document(
 
     try:
         genai_client, collection = _init_clients()
-    except RuntimeError as exc:
-        return {"status": "error", "message": str(exc)}
+    except Exception as exc:
+        return {"status": "error", "message": f"Client init failed: {exc}"}
 
     try:
         embeddings = embed_chunks(genai_client, chunks)
@@ -302,8 +319,10 @@ def crawl_department_subtree(base_url: str, max_pages: int = 50) -> list[dict[st
     visited: set[str] = set()
     queue: list[str] = [base_url]
     results: list[dict[str, str]] = []
+    current_delay = CRAWL_DELAY  # adaptive — doubles on 4xx, resets on success
 
-    log.info("ODK web crawl | base=%s | max_pages=%d", base_url, max_pages)
+    log.info("ODK web crawl | base=%s | max_pages=%d | delay=%.1fs±%.1fs",
+             base_url, max_pages, CRAWL_DELAY, CRAWL_JITTER)
 
     while queue and len(results) < max_pages:
         url = queue.pop(0)
@@ -317,14 +336,36 @@ def crawl_department_subtree(base_url: str, max_pages: int = 50) -> list[dict[st
         if any(path_lower.endswith(ext) for ext in SKIP_EXTENSIONS):
             continue
 
+        # Skip known noise paths (tag pages, author archives, news articles, etc.)
+        if any(pat in url for pat in SKIP_URL_PATTERNS):
+            log.debug("  skip pattern match %s", url)
+            continue
+
+        # Polite delay with jitter — never hammer the server
+        sleep_time = current_delay + random.uniform(-CRAWL_JITTER, CRAWL_JITTER)
+        time.sleep(max(0.1, sleep_time))
+
         try:
             resp = http_requests.get(url, headers=CRAWL_HEADERS, timeout=15)
             resp.raise_for_status()
             if "text/html" not in resp.headers.get("content-type", ""):
+                current_delay = max(CRAWL_DELAY, current_delay * 0.75)  # ease back after non-html
                 continue
+        except http_requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status in (403, 429, 503):
+                # Rate-limit signal: back off exponentially
+                current_delay = min(current_delay * 2, CRAWL_MAX_DELAY)
+                log.warning("  Fetch %d %s — delay now %.1fs", status, url, current_delay)
+            else:
+                log.warning("  Fetch failed %s: %s", url, exc)
+            continue
         except Exception as exc:
             log.warning("  Fetch failed %s: %s", url, exc)
             continue
+
+        # Successful fetch — slowly ease back toward baseline
+        current_delay = max(CRAWL_DELAY, current_delay * 0.9)
 
         soup = BeautifulSoup(resp.text, "lxml")
 
@@ -392,8 +433,8 @@ def crawl_and_index_department(
 
     try:
         genai_client, collection = _init_clients()
-    except RuntimeError as exc:
-        return {"status": "error", "message": str(exc)}
+    except Exception as exc:
+        return {"status": "error", "message": f"Client init failed: {exc}"}
 
     total_vectors = 0
     for page in pages:
