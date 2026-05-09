@@ -8,163 +8,402 @@
 </head>
 <body class="min-h-screen bg-gray-950 text-gray-100 px-4 py-12">
 
-  <div class="max-w-5xl mx-auto">
+<div class="max-w-6xl mx-auto">
 
-    <!-- Header -->
-    <div class="flex items-center justify-between mb-8">
-      <div class="flex items-center gap-3">
-        <div class="w-9 h-9 rounded-lg bg-orange-500 flex items-center justify-center text-white font-bold">O</div>
-        <div>
-          <h1 class="text-xl font-bold leading-tight">ODK Admin Panel</h1>
-          <p class="text-xs text-gray-500">Review and approve department knowledge submissions</p>
-        </div>
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-8">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-lg bg-orange-500 flex items-center justify-center text-white font-bold">O</div>
+      <div>
+        <h1 class="text-xl font-bold leading-tight">ODK Admin Panel</h1>
+        <p class="text-xs text-gray-500">Review submissions and monitor crawl progress</p>
       </div>
+    </div>
+    <div class="flex items-center gap-3">
+      <a href="/admin/graph" target="_blank"
+         class="flex items-center gap-2 px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700
+                text-gray-300 hover:text-white text-sm font-medium transition-colors border border-gray-700">
+        <!-- graph icon -->
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round"
+            d="M7.5 14.25v2.25m3-4.5v4.5m3-9v9m3-3.75v3.75M6 20.25h12A2.25 2.25 0 0020.25 18V6A2.25 2.25 0 0018 3.75H6A2.25 2.25 0 003.75 6v12A2.25 2.25 0 006 20.25z"/>
+        </svg>
+        View Knowledge Graph
+      </a>
       <a href="/" class="text-sm text-gray-400 hover:text-orange-400 transition-colors">← Submission portal</a>
     </div>
-
-    <!-- Filter tabs -->
-    <div class="flex gap-2 mb-6">
-      {% for tab in tabs %}
-      <a href="/admin?filter={{ tab[0] }}"
-         class="px-4 py-1.5 rounded-full text-sm font-medium transition-colors
-                {% if filter == tab[0] %}bg-orange-500 text-white{% else %}bg-gray-800 text-gray-400 hover:text-white{% endif %}">
-        {{ tab[1] }}
-      </a>
-      {% endfor %}
-    </div>
-
-    <!-- Table -->
-    {% if submissions %}
-    <div class="rounded-xl border border-gray-800 overflow-hidden">
-      <table class="w-full text-sm">
-        <thead class="bg-gray-900 text-gray-400 text-xs uppercase tracking-wider">
-          <tr>
-            <th class="px-5 py-3 text-left">Document</th>
-            <th class="px-5 py-3 text-left">Department</th>
-            <th class="px-5 py-3 text-left">Submitter</th>
-            <th class="px-5 py-3 text-left">Submitted</th>
-            <th class="px-5 py-3 text-left">Status</th>
-            <th class="px-5 py-3 text-right">Actions</th>
-          </tr>
-        </thead>
-        <tbody class="divide-y divide-gray-800">
-          {% for sub in submissions %}
-          <tr class="bg-gray-900/40 hover:bg-gray-900 transition-colors">
-
-            <!-- Document -->
-            <td class="px-5 py-4">
-              <p class="font-medium text-white truncate max-w-[180px]" title="{{ sub.filename }}">{{ sub.filename }}</p>
-            </td>
-
-            <!-- Department -->
-            <td class="px-5 py-4">
-              <p class="text-gray-200 font-medium">{{ sub.department_name }}</p>
-              <p class="text-xs text-gray-500 truncate max-w-[200px]">{{ sub.department_url }}</p>
-            </td>
-
-            <!-- Submitter -->
-            <td class="px-5 py-4 text-gray-400 text-xs">{{ sub.submitter_email }}</td>
-
-            <!-- Date -->
-            <td class="px-5 py-4 text-gray-500 text-xs whitespace-nowrap">{{ sub.created_at | fmt_time }}</td>
-
-            <!-- Status badge -->
-            <td class="px-5 py-4">
-              {% if sub.status == "pending" %}
-              <span class="px-2 py-0.5 rounded-full bg-yellow-900/60 text-yellow-400 text-xs font-medium border border-yellow-800">Pending</span>
-              {% elif sub.status == "accepted" %}
-              <span class="px-2 py-0.5 rounded-full bg-green-900/60 text-green-400 text-xs font-medium border border-green-800">Accepted</span>
-              {% else %}
-              <span class="px-2 py-0.5 rounded-full bg-red-900/60 text-red-400 text-xs font-medium border border-red-800">Rejected</span>
-              {% if sub.rejection_reason %}
-              <p class="mt-1 text-xs text-gray-500 max-w-[160px] truncate" title="{{ sub.rejection_reason }}">{{ sub.rejection_reason }}</p>
-              {% endif %}
-              {% endif %}
-            </td>
-
-            <!-- Actions -->
-            <td class="px-5 py-4">
-              <div class="flex items-center justify-end gap-2">
-
-                {% if sub.status == "pending" %}
-                <!-- Accept -->
-                <form method="post" action="/admin/{{ sub.id }}/accept">
-                  <button type="submit"
-                          class="px-3 py-1.5 rounded-lg bg-green-700 hover:bg-green-600 text-white text-xs font-medium transition-colors">
-                    Accept
-                  </button>
-                </form>
-
-                <!-- Reject with reason dialog -->
-                <button onclick="openReject('{{ sub.id }}')"
-                        class="px-3 py-1.5 rounded-lg bg-gray-700 hover:bg-red-700 text-gray-300 hover:text-white text-xs font-medium transition-colors">
-                  Reject
-                </button>
-                {% endif %}
-
-                <!-- Delete -->
-                <form method="post" action="/admin/{{ sub.id }}/delete"
-                      onsubmit="return confirm('Permanently delete this submission?')">
-                  <button type="submit"
-                          class="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-500 hover:text-red-400 text-xs transition-colors">
-                    Delete
-                  </button>
-                </form>
-
-              </div>
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-
-    {% else %}
-    <div class="flex flex-col items-center justify-center py-24 text-gray-600">
-      <svg class="w-12 h-12 mb-4 text-gray-700" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/>
-      </svg>
-      <p class="text-sm">No submissions
-        {% if filter != "all" %} with status <strong class="text-gray-500">{{ filter }}</strong>{% endif %}.
-      </p>
-    </div>
-    {% endif %}
-
   </div>
 
-  <!-- Reject reason modal -->
-  <div id="reject-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 px-4">
-    <form id="reject-form" method="post" class="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-md shadow-2xl">
-      <h2 class="text-lg font-semibold text-white mb-4">Reject submission</h2>
-      <label class="block text-sm text-gray-400 mb-2">Reason <span class="text-gray-600">(optional)</span></label>
-      <textarea name="reason" rows="3" placeholder="E.g. file appears incomplete, please resubmit."
-                class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-white
-                       placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-orange-500 resize-none"></textarea>
-      <div class="flex gap-3 mt-5">
-        <button type="submit"
-                class="flex-1 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors">
-          Confirm rejection
-        </button>
-        <button type="button" onclick="closeReject()"
-                class="flex-1 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-300 text-sm font-medium transition-colors">
-          Cancel
-        </button>
+  <!-- Filter tabs -->
+  <div class="flex gap-2 mb-6">
+    {% for tab in tabs %}
+    <a href="/admin?filter={{ tab[0] }}"
+       class="px-4 py-1.5 rounded-full text-sm font-medium transition-colors
+              {% if filter == tab[0] %}bg-orange-500 text-white{% else %}bg-gray-800 text-gray-400 hover:text-white{% endif %}">
+      {{ tab[1] }}
+    </a>
+    {% endfor %}
+  </div>
+
+  <!-- Submissions -->
+  {% if submissions %}
+  <div class="space-y-4">
+    {% for sub in submissions %}
+    <div class="rounded-xl border border-gray-800 bg-gray-900/40 overflow-hidden">
+
+      <!-- Main row -->
+      <div class="flex items-start gap-4 px-5 py-4">
+
+        <!-- Status badge -->
+        <div class="pt-0.5 shrink-0">
+          {% if sub.status == "pending" %}
+          <span class="px-2 py-0.5 rounded-full bg-yellow-900/60 text-yellow-400 text-xs font-medium border border-yellow-800">Pending</span>
+          {% elif sub.status == "accepted" %}
+          <span class="px-2 py-0.5 rounded-full bg-green-900/60 text-green-400 text-xs font-medium border border-green-800">Accepted</span>
+          {% else %}
+          <span class="px-2 py-0.5 rounded-full bg-red-900/60 text-red-400 text-xs font-medium border border-red-800">Rejected</span>
+          {% endif %}
+        </div>
+
+        <!-- Info -->
+        <div class="flex-1 min-w-0">
+          <p class="font-semibold text-white truncate">{{ sub.filename }}</p>
+          <p class="text-sm text-gray-300 font-medium mt-0.5">{{ sub.department_name }}</p>
+          <p class="text-xs text-gray-500 truncate">{{ sub.department_url }}</p>
+          <p class="text-xs text-gray-600 mt-1">{{ sub.submitter_email }} · {{ sub.created_at | fmt_time }}</p>
+          {% if sub.rejection_reason %}
+          <p class="text-xs text-red-400 mt-1 italic">Reason: {{ sub.rejection_reason }}</p>
+          {% endif %}
+        </div>
+
+        <!-- Actions -->
+        <div class="flex items-center gap-2 shrink-0">
+          {% if sub.status == "pending" %}
+          <form method="post" action="/admin/{{ sub.id }}/accept">
+            <button type="submit"
+                    class="px-3 py-1.5 rounded-lg bg-green-700 hover:bg-green-600 text-white text-xs font-medium transition-colors">
+              Accept
+            </button>
+          </form>
+          <button onclick="openReject('{{ sub.id }}')"
+                  class="px-3 py-1.5 rounded-lg bg-gray-700 hover:bg-red-700 text-gray-300 hover:text-white text-xs font-medium transition-colors">
+            Reject
+          </button>
+          {% endif %}
+          <form method="post" action="/admin/{{ sub.id }}/delete"
+                onsubmit="return confirm('Permanently delete this submission?')">
+            <button type="submit"
+                    class="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-500 hover:text-red-400 text-xs transition-colors">
+              Delete
+            </button>
+          </form>
+        </div>
       </div>
-    </form>
+
+      <!-- Crawl status (accepted submissions only) -->
+      {% if sub.status == "accepted" %}
+      {% set run = crawl_runs.get(sub.id) %}
+      <div class="border-t border-gray-800 px-5 py-3 bg-gray-900/60"
+           id="crawl-{{ sub.id }}"
+           data-sub-id="{{ sub.id }}"
+           data-polling="{{ 'true' if run and (run.doc_status == 'running' or run.web_status == 'running') else 'false' }}">
+
+        {% if run %}
+        <!-- Static render (replaced by JS when polling) -->
+        <div class="flex flex-wrap items-start gap-6">
+
+          <!-- Doc status -->
+          <div class="min-w-[140px]">
+            <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Document</p>
+            <div class="flex items-center gap-1.5">
+              {% if run.doc_status == "done" %}
+              <div class="w-2 h-2 rounded-full bg-green-500"></div>
+              <span class="text-xs text-green-400">Indexed</span>
+              <span class="text-xs text-gray-600 ml-1">· {{ run.doc_vectors }} vectors</span>
+              {% elif run.doc_status == "running" %}
+              <div class="w-2 h-2 rounded-full bg-yellow-500 animate-pulse"></div>
+              <span class="text-xs text-yellow-400">Indexing…</span>
+              {% elif run.doc_status == "failed" %}
+              <div class="w-2 h-2 rounded-full bg-red-500"></div>
+              <span class="text-xs text-red-400">Failed</span>
+              {% else %}
+              <div class="w-2 h-2 rounded-full bg-gray-600"></div>
+              <span class="text-xs text-gray-500">Queued</span>
+              {% endif %}
+            </div>
+          </div>
+
+          <!-- Web crawl status -->
+          <div class="min-w-[220px]">
+            <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Web crawl</p>
+            <div class="flex items-center gap-1.5">
+              {% if run.web_status == "done" %}
+              <div class="w-2 h-2 rounded-full bg-green-500"></div>
+              <span class="text-xs text-green-400">Done</span>
+              <span class="text-xs text-gray-600 ml-1">· {{ run.pages_indexed }}/{{ run.pages_found }} pages · {{ run.web_vectors }} vectors</span>
+              {% elif run.web_status == "running" %}
+              <div class="w-2 h-2 rounded-full bg-yellow-500 animate-pulse"></div>
+              <span class="text-xs text-yellow-400 font-medium">Crawling…</span>
+              <span class="text-xs text-gray-500 ml-1">{{ run.pages_indexed }} pages indexed so far</span>
+              {% elif run.web_status == "failed" %}
+              <div class="w-2 h-2 rounded-full bg-red-500"></div>
+              <span class="text-xs text-red-400">Failed</span>
+              {% else %}
+              <div class="w-2 h-2 rounded-full bg-gray-600"></div>
+              <span class="text-xs text-gray-500">Queued</span>
+              {% endif %}
+            </div>
+          </div>
+
+          <!-- Timestamps -->
+          {% if run.started_at %}
+          <div class="min-w-[160px]">
+            <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Started</p>
+            <p class="text-xs text-gray-400">{{ run.started_at | fmt_time }}</p>
+          </div>
+          {% endif %}
+          {% if run.finished_at %}
+          <div class="min-w-[160px]">
+            <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Finished</p>
+            <p class="text-xs text-gray-400">{{ run.finished_at | fmt_time }}</p>
+          </div>
+          {% endif %}
+
+        </div>
+
+        <!-- Pages crawled table (collapsible) -->
+        {% if run.pages_found > 0 %}
+        <div class="mt-3">
+          <button onclick="togglePages('{{ sub.id }}')"
+                  class="text-xs text-gray-500 hover:text-orange-400 transition-colors flex items-center gap-1">
+            <svg id="chevron-{{ sub.id }}" class="w-3 h-3 transition-transform" fill="none" stroke="currentColor"
+                 stroke-width="2" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5"/>
+            </svg>
+            <span id="pages-label-{{ sub.id }}">Show {{ run.pages_found }} crawled pages</span>
+          </button>
+          <div id="pages-{{ sub.id }}" class="hidden mt-2">
+            {% set pages = [] %}
+            <!-- Pages rendered by JS polling; static fallback below -->
+            <div id="pages-table-{{ sub.id }}">
+              <p class="text-xs text-gray-600 italic">Loading page list…</p>
+            </div>
+          </div>
+        </div>
+        {% endif %}
+
+        {% else %}
+        <!-- No run record yet -->
+        <div class="flex items-center gap-2 text-xs text-gray-600">
+          <div class="w-2 h-2 rounded-full bg-gray-700 animate-pulse"></div>
+          Indexing queued…
+        </div>
+        {% endif %}
+
+      </div>
+      {% endif %}
+
+    </div>
+    {% endfor %}
   </div>
 
-  <script>
-    function openReject(id) {
-      document.getElementById('reject-form').action = '/admin/' + id + '/reject';
-      document.getElementById('reject-modal').classList.remove('hidden');
-    }
-    function closeReject() {
-      document.getElementById('reject-modal').classList.add('hidden');
-    }
-    document.getElementById('reject-modal').addEventListener('click', function(e) {
-      if (e.target === this) closeReject();
-    });
-  </script>
+  {% else %}
+  <div class="flex flex-col items-center justify-center py-24 text-gray-600">
+    <svg class="w-12 h-12 mb-4 text-gray-700" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round"
+        d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/>
+    </svg>
+    <p class="text-sm">No submissions{% if filter != "all" %} with status <strong class="text-gray-500">{{ filter }}</strong>{% endif %}.</p>
+  </div>
+  {% endif %}
+
+</div>
+
+<!-- Reject modal -->
+<div id="reject-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 px-4">
+  <form id="reject-form" method="post" class="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-md shadow-2xl">
+    <h2 class="text-lg font-semibold text-white mb-4">Reject submission</h2>
+    <label class="block text-sm text-gray-400 mb-2">Reason <span class="text-gray-600">(optional)</span></label>
+    <textarea name="reason" rows="3" placeholder="E.g. file appears incomplete, please resubmit."
+              class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-white
+                     placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-orange-500 resize-none"></textarea>
+    <div class="flex gap-3 mt-5">
+      <button type="submit"
+              class="flex-1 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors">
+        Confirm rejection
+      </button>
+      <button type="button" onclick="closeReject()"
+              class="flex-1 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-300 text-sm font-medium transition-colors">
+        Cancel
+      </button>
+    </div>
+  </form>
+</div>
+
+<script>
+// ── Reject modal ─────────────────────────────────────────────────────────────
+function openReject(id) {
+  document.getElementById('reject-form').action = '/admin/' + id + '/reject';
+  document.getElementById('reject-modal').classList.remove('hidden');
+}
+function closeReject() {
+  document.getElementById('reject-modal').classList.add('hidden');
+}
+document.getElementById('reject-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeReject();
+});
+
+// ── Collapsible page list ─────────────────────────────────────────────────────
+function togglePages(subId) {
+  const el = document.getElementById('pages-' + subId);
+  const chevron = document.getElementById('chevron-' + subId);
+  const label = document.getElementById('pages-label-' + subId);
+  const hidden = el.classList.toggle('hidden');
+  chevron.style.transform = hidden ? '' : 'rotate(90deg)';
+  if (!hidden) {
+    fetchAndRenderPages(subId);
+  }
+}
+
+function renderPagesTable(pages) {
+  if (!pages || !pages.length) return '<p class="text-xs text-gray-600 italic">No pages yet.</p>';
+  const rows = pages.map(p => `
+    <tr class="border-b border-gray-800 hover:bg-gray-800/50">
+      <td class="py-1.5 pr-3 max-w-xs">
+        <a href="${p.url}" target="_blank" class="text-blue-400 hover:underline text-xs truncate block" title="${p.url}">${p.title || p.url}</a>
+        <span class="text-xs text-gray-600 truncate block">${p.url}</span>
+      </td>
+      <td class="py-1.5 pr-3 text-xs text-gray-400 whitespace-nowrap">${p.word_count.toLocaleString()} words</td>
+      <td class="py-1.5 pr-3 text-xs text-gray-400 whitespace-nowrap">${p.chunks} chunks</td>
+      <td class="py-1.5 pr-3 text-xs text-gray-400 whitespace-nowrap">${p.vectors} vectors</td>
+      <td class="py-1.5 text-xs whitespace-nowrap">
+        ${p.status === 'indexed'
+          ? '<span class="text-green-400">✓ indexed</span>'
+          : p.status === 'failed'
+          ? '<span class="text-red-400">✗ failed</span>'
+          : '<span class="text-gray-500">' + p.status + '</span>'}
+      </td>
+    </tr>`).join('');
+  return `<table class="w-full text-left">
+    <thead><tr class="text-xs text-gray-500 uppercase tracking-wide">
+      <th class="pb-1 pr-3">Page</th>
+      <th class="pb-1 pr-3">Words</th>
+      <th class="pb-1 pr-3">Chunks</th>
+      <th class="pb-1 pr-3">Vectors</th>
+      <th class="pb-1">Status</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+async function fetchAndRenderPages(subId) {
+  try {
+    const res = await fetch('/api/status/' + subId);
+    const data = await res.json();
+    const el = document.getElementById('pages-table-' + subId);
+    if (el) el.innerHTML = renderPagesTable(data.pages || []);
+  } catch (e) { /* ignore */ }
+}
+
+// ── Live polling for running submissions ──────────────────────────────────────
+function fmtStatus(status, vectors) {
+  const dot = status === 'done'
+    ? '<span class="inline-block w-2 h-2 rounded-full bg-green-500 mr-1.5"></span>'
+    : status === 'running'
+    ? '<span class="inline-block w-2 h-2 rounded-full bg-yellow-500 animate-pulse mr-1.5"></span>'
+    : status === 'failed'
+    ? '<span class="inline-block w-2 h-2 rounded-full bg-red-500 mr-1.5"></span>'
+    : '<span class="inline-block w-2 h-2 rounded-full bg-gray-600 mr-1.5"></span>';
+  const label = {done:'Done', running:'Running…', failed:'Failed', pending:'Queued'}[status] || status;
+  const colour = {done:'text-green-400', running:'text-yellow-400', failed:'text-red-400'}[status] || 'text-gray-500';
+  return dot + `<span class="text-xs ${colour}">${label}</span>`;
+}
+
+function updateCrawlUI(subId, data) {
+  const container = document.getElementById('crawl-' + subId);
+  if (!container) return;
+
+  const isRunning = data.doc_status === 'running' || data.web_status === 'running';
+  container.dataset.polling = isRunning ? 'true' : 'false';
+
+  // Re-render the status strip inline
+  const pagesOpen = !document.getElementById('pages-' + subId)?.classList.contains('hidden');
+
+  container.innerHTML = `
+    <div class="flex flex-wrap items-start gap-6">
+      <div class="min-w-[140px]">
+        <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Document</p>
+        <div class="flex items-center gap-1.5">
+          ${fmtStatus(data.doc_status)}
+          ${data.doc_status === 'done' ? `<span class="text-xs text-gray-600 ml-1">· ${data.doc_vectors} vectors</span>` : ''}
+        </div>
+      </div>
+      <div class="min-w-[260px]">
+        <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Web crawl</p>
+        <div class="flex items-center gap-1.5">
+          ${fmtStatus(data.web_status)}
+          <span class="text-xs text-gray-600 ml-1">
+            · ${data.pages_indexed}/${data.pages_found} pages
+            ${data.web_status === 'done' ? `· ${data.web_vectors} vectors` : ''}
+          </span>
+        </div>
+        ${data.pages_found > 0 && data.web_status === 'running' ? `
+          <div class="mt-1.5 w-full bg-gray-800 rounded-full h-1.5 max-w-xs">
+            <div class="bg-orange-500 h-1.5 rounded-full transition-all"
+                 style="width:${Math.min(100, Math.round(data.pages_indexed / Math.max(data.pages_found, 1) * 100))}%"></div>
+          </div>` : ''}
+      </div>
+      ${data.started_at ? `<div class="min-w-[140px]">
+        <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Started</p>
+        <p class="text-xs text-gray-400">${new Date(data.started_at * 1000).toUTCString().replace(' GMT','') + ' UTC'}</p>
+      </div>` : ''}
+      ${data.finished_at ? `<div class="min-w-[140px]">
+        <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Finished</p>
+        <p class="text-xs text-gray-400">${new Date(data.finished_at * 1000).toUTCString().replace(' GMT','') + ' UTC'}</p>
+      </div>` : ''}
+    </div>
+    ${data.pages_found > 0 ? `
+    <div class="mt-3">
+      <button onclick="togglePages('${subId}')"
+              class="text-xs text-gray-500 hover:text-orange-400 transition-colors flex items-center gap-1">
+        <svg id="chevron-${subId}" class="w-3 h-3 transition-transform${pagesOpen ? ' rotate-90' : ''}"
+             fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5"/>
+        </svg>
+        <span id="pages-label-${subId}">${data.pages_found} crawled pages</span>
+      </button>
+      <div id="pages-${subId}" class="${pagesOpen ? '' : 'hidden'} mt-2">
+        <div id="pages-table-${subId}">
+          ${pagesOpen ? renderPagesTable(data.pages || []) : ''}
+        </div>
+      </div>
+    </div>` : ''}
+  `;
+}
+
+async function pollStatus(subId) {
+  try {
+    const res = await fetch('/api/status/' + subId);
+    const data = await res.json();
+    if (data.found) updateCrawlUI(subId, data);
+  } catch (e) { /* network hiccup — keep polling */ }
+}
+
+// Start polling for any submission still running
+(function startPolling() {
+  const containers = document.querySelectorAll('[data-sub-id][data-polling="true"]');
+  containers.forEach(el => {
+    const subId = el.dataset.subId;
+    // Immediate fetch + then every 3s
+    pollStatus(subId);
+    const iv = setInterval(async () => {
+      await pollStatus(subId);
+      const updated = document.getElementById('crawl-' + subId);
+      if (!updated || updated.dataset.polling !== 'true') clearInterval(iv);
+    }, 3000);
+  });
+})();
+</script>
 
 </body>
 </html>

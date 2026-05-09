@@ -365,6 +365,7 @@ def crawl_and_index_department(
     department_url: str,
     max_pages: int = 50,
     dry_run: bool = False,
+    on_page_indexed=None,
 ) -> dict[str, Any]:
     """Crawl the department's public URL subtree and index every page into odk-knowledge.
 
@@ -372,9 +373,11 @@ def crawl_and_index_department(
     ODK agent finds both web content and uploaded documents in a single search.
 
     Args:
-        department_url: The department's oregonstate.edu URL subtree.
-        max_pages:      Maximum number of pages to crawl (default 50).
-        dry_run:        If True, crawl but skip embedding and Firestore writes.
+        department_url:   The department's oregonstate.edu URL subtree.
+        max_pages:        Maximum number of pages to crawl (default 50).
+        dry_run:          If True, crawl but skip embedding and Firestore writes.
+        on_page_indexed:  Optional callback(url, title, word_count, chunks, vectors, status)
+                          called after each page is processed.
     """
     dept = _normalize_dept(department_url)
     pages = crawl_department_subtree(department_url, max_pages=max_pages)
@@ -397,15 +400,20 @@ def crawl_and_index_department(
         url = page["url"]
         title = page["title"]
         text = page["text"]
+        word_count = len(text.split())
 
         chunks = chunk_text(text)
         if not chunks:
+            if on_page_indexed:
+                on_page_indexed(url, title, word_count, 0, 0, "skipped")
             continue
 
         try:
             embeddings = embed_chunks(genai_client, chunks)
         except Exception as exc:
             log.error("  Embedding failed for %s: %s", url, exc)
+            if on_page_indexed:
+                on_page_indexed(url, title, word_count, len(chunks), 0, "failed")
             continue
 
         deleted = delete_old_vectors(collection, dept, url)
@@ -419,8 +427,12 @@ def crawl_and_index_department(
             )
             total_vectors += count
             log.info("  Upserted %d vectors for %s", count, url)
+            if on_page_indexed:
+                on_page_indexed(url, title, word_count, len(chunks), count, "indexed")
         except Exception as exc:
             log.error("  Firestore upsert failed for %s: %s", url, exc)
+            if on_page_indexed:
+                on_page_indexed(url, title, word_count, len(chunks), 0, "failed")
 
     return {
         "status": "ok",
